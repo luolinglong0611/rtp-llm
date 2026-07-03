@@ -394,6 +394,9 @@ void NormalEngine::pause() {
         }
         RTP_LLM_LOG_INFO("normal engine pause requested, epoch=%lu", epoch);
     }
+    if (scheduler_) {
+        scheduler_->wake();
+    }
 }
 
 void NormalEngine::restart() {

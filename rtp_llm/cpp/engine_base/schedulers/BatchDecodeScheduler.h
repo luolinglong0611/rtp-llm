@@ -199,9 +199,10 @@ public:
     absl::StatusOr<std::list<GenerateStreamPtr>> schedule() override {
         std::unique_lock<std::mutex> lock(lock_);
         cond_.wait_for(lock, std::chrono::seconds(30), [this] {
-            return stop_ || waiting_streams_.size() >= batch_size_ || running_streams_.size() > 0
+            return stop_ || wake_requested_ || waiting_streams_.size() >= batch_size_ || running_streams_.size() > 0
                    || !loading_cache_streams_.empty();
         });
+        wake_requested_ = false;
         if (stop_) {
             return running_streams_;
         }
@@ -245,6 +246,14 @@ public:
         return absl::OkStatus();
     }
 
+    void wake() override {
+        {
+            std::lock_guard<std::mutex> lock(lock_);
+            wake_requested_ = true;
+        }
+        cond_.notify_all();
+    }
+
     bool empty() override {
         std::lock_guard<std::mutex> lock(lock_);
         return waiting_streams_.empty() && loading_cache_streams_.empty() && running_streams_.empty();
@@ -271,6 +280,7 @@ private:
     uint32_t                     current_step_ = 0;
     std::atomic<int64_t>         last_schedule_time_{autil::TimeUtility::currentTimeInMilliSeconds()};
     std::atomic<bool>            stop_{false};
+    bool                         wake_requested_ = false;
 
     std::shared_ptr<KVCacheManager> cache_manager_;
     kmonitor::MetricsReporterPtr    metrics_reporter_;
