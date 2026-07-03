@@ -164,6 +164,12 @@ def configure_subprocess() -> Iterator[None]:
         yield
 
 
+def start_configured_process(process: Any) -> None:
+    """Start a child process with weight memory saver preload when required."""
+    with configure_subprocess():
+        process.start()
+
+
 def is_paused() -> bool:
     """Whether the weights region is currently paused (physical pages released)."""
     return _paused

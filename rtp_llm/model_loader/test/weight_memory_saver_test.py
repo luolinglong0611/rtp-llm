@@ -72,6 +72,16 @@ class _FakeTorchMemorySaverModule(types.ModuleType):
                 os.environ["LD_PRELOAD"] = old_value
 
 
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.started = False
+        self.ld_preload_at_start: Optional[str] = None
+
+    def start(self) -> None:
+        self.started = True
+        self.ld_preload_at_start = os.environ.get("LD_PRELOAD")
+
+
 class WeightMemorySaverTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._saved_env = {
@@ -229,6 +239,21 @@ class FakeTmsForwardingTest(WeightMemorySaverTestBase):
             self.assertEqual(
                 os.environ.get("LD_PRELOAD"), "fake_torch_memory_saver_preload.so"
             )
+        self.assertEqual(module.configure_subprocess_enter_count, 1)
+        self.assertEqual(module.configure_subprocess_exit_count, 1)
+        self.assertEqual(os.environ.get("LD_PRELOAD"), old_value)
+
+    def test_start_configured_process_forwards_preload(self) -> None:
+        module = self._get_fake_module()
+        old_value = os.environ.get("LD_PRELOAD")
+        process = _FakeProcess()
+
+        wms.start_configured_process(process)
+
+        self.assertTrue(process.started)
+        self.assertEqual(
+            process.ld_preload_at_start, "fake_torch_memory_saver_preload.so"
+        )
         self.assertEqual(module.configure_subprocess_enter_count, 1)
         self.assertEqual(module.configure_subprocess_exit_count, 1)
         self.assertEqual(os.environ.get("LD_PRELOAD"), old_value)
