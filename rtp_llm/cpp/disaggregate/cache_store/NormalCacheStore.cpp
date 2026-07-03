@@ -115,7 +115,18 @@ void NormalCacheStore::store(const std::shared_ptr<RequestBlockBuffer>& request_
     auto counted_callback = countTransfer(std::move(callback));
     // task 只在threadpool中运行, threadpool退出前会清理所有running task, 用this是安全的
     auto task = [this, request_block_buffer, counted_callback, collector]() {
-        this->runStoreTask(request_block_buffer, counted_callback, collector);
+        try {
+            this->runStoreTask(request_block_buffer, counted_callback, collector);
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("normal cache store run store task exception, request id is %s, error is %s",
+                              request_block_buffer->getRequestId().c_str(),
+                              e.what());
+            counted_callback(false, CacheStoreErrorCode::StoreFailed);
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("normal cache store run store task unknown exception, request id is %s",
+                              request_block_buffer->getRequestId().c_str());
+            counted_callback(false, CacheStoreErrorCode::StoreFailed);
+        }
     };
 
     std::unique_lock<std::shared_mutex> lock(store_tasks_mutex_);
@@ -194,15 +205,26 @@ void NormalCacheStore::load(const std::shared_ptr<RequestBlockBuffer>& request_b
                  collector,
                  partition_count,
                  partition_id]() {
-        this->runLoadTask(request_block_buffer,
-                          counted_callback,
-                          ip,
-                          port,
-                          rdma_port,
-                          timeout_ms,
-                          collector,
-                          partition_count,
-                          partition_id);
+        try {
+            this->runLoadTask(request_block_buffer,
+                              counted_callback,
+                              ip,
+                              port,
+                              rdma_port,
+                              timeout_ms,
+                              collector,
+                              partition_count,
+                              partition_id);
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("normal cache store run load task exception, request id is %s, error is %s",
+                              request_block_buffer->getRequestId().c_str(),
+                              e.what());
+            counted_callback(false, CacheStoreErrorCode::LoadErrorUnknown);
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("normal cache store run load task unknown exception, request id is %s",
+                              request_block_buffer->getRequestId().c_str());
+            counted_callback(false, CacheStoreErrorCode::LoadErrorUnknown);
+        }
     };
 
     if (thread_pool_->pushTask(task) != autil::ThreadPoolBase::ERROR_NONE) {
@@ -265,15 +287,15 @@ NormalCacheStore::submitRemoteStoreTask(const std::shared_ptr<RemoteStoreRequest
     std::weak_ptr<RemoteStoreTaskImpl> weak_task  = task;
     RequestBlockBuffer::WatchFunc      watchFunc =
         [this, request_id, weak_task](bool ok, const std::vector<std::shared_ptr<BlockBuffer>>& blocks) {
-            if (!ok) {
-                RTP_LLM_LOG_WARNING("normal cache store run store task watch func failed, request id is %s",
-                                    request_id.c_str());
-                return;
-            }
-
             auto task = weak_task.lock();
             if (!task) {
                 RTP_LLM_LOG_DEBUG("task has been released, request id is %s", request_id.c_str());
+                return;
+            }
+            if (!ok) {
+                RTP_LLM_LOG_WARNING("normal cache store run store task watch func failed, request id is %s",
+                                    request_id.c_str());
+                task->notifyRequestDone({}, false);
                 return;
             }
 
@@ -294,11 +316,36 @@ NormalCacheStore::submitRemoteStoreTask(const std::shared_ptr<RemoteStoreRequest
 
 void NormalCacheStore::releaseRemoteStoreTask(const std::shared_ptr<RemoteStoreTask>& task) {
     std::unique_lock<std::shared_mutex> lock(remote_store_tasks_mutex_);
-    auto&                               tasks = remote_store_tasks_[task->getRequestId()];
+    auto                                iter  = remote_store_tasks_.find(task->getRequestId());
+    if (iter == remote_store_tasks_.end()) {
+        return;
+    }
+    auto& tasks = iter->second;
     tasks.erase(std::remove(tasks.begin(), tasks.end(), task), tasks.end());
+    if (tasks.empty()) {
+        remote_store_tasks_.erase(iter);
+    }
 }
 
 void NormalCacheStore::markRequestEnd(const std::string& requestid) {
+    std::vector<CacheStoreStoreDoneCallback> pending_store_callbacks;
+    {
+        std::unique_lock<std::shared_mutex> lock(store_tasks_mutex_);
+        for (auto it = store_tasks_.begin(); it != store_tasks_.end();) {
+            auto& buffer = it->first;
+            if (buffer && buffer->getRequestId() == requestid) {
+                pending_store_callbacks.emplace_back(std::move(it->second.first));
+                it = store_tasks_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& callback : pending_store_callbacks) {
+        if (callback) {
+            callback(true, CacheStoreErrorCode::None);
+        }
+    }
     request_block_buffer_store_->delRequestBlockBuffer(requestid);
 }
 
@@ -318,7 +365,11 @@ size_t NormalCacheStore::activeTransferCount() const {
     size_t                              count = active_transfer_count_.load(std::memory_order_relaxed);
     std::shared_lock<std::shared_mutex> lock(remote_store_tasks_mutex_);
     for (const auto& [request_id, tasks] : remote_store_tasks_) {
-        count += tasks.size();
+        for (const auto& task : tasks) {
+            if (task && !task->done()) {
+                count++;
+            }
+        }
     }
     return count;
 }

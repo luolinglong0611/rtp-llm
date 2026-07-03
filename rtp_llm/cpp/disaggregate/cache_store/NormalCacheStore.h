@@ -108,7 +108,7 @@ private:
     mutable std::shared_mutex                                                        remote_store_tasks_mutex_;
     std::unordered_map<std::string, std::list<std::shared_ptr<RemoteStoreTaskImpl>>> remote_store_tasks_;
     std::atomic<size_t>                                                              active_transfer_count_{0};
-    std::shared_mutex                                                                store_tasks_mutex_;
+    mutable std::shared_mutex                                                        store_tasks_mutex_;
     std::unordered_map<std::shared_ptr<RequestBlockBuffer>,
                        std::pair<CacheStoreStoreDoneCallback, std::function<void()>>>
         store_tasks_;
