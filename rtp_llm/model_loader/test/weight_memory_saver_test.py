@@ -50,6 +50,28 @@ class _FakeTms:
         self.resume_calls.append(tag)
 
 
+class _FakeTorchMemorySaverModule(types.ModuleType):
+    def __init__(self, fake_tms: _FakeTms) -> None:
+        super().__init__(_TMS_MODULE)
+        self.torch_memory_saver = fake_tms
+        self.configure_subprocess_enter_count = 0
+        self.configure_subprocess_exit_count = 0
+
+    @contextlib.contextmanager
+    def configure_subprocess(self) -> Iterator[None]:
+        self.configure_subprocess_enter_count += 1
+        old_value = os.environ.get("LD_PRELOAD")
+        os.environ["LD_PRELOAD"] = "fake_torch_memory_saver_preload.so"
+        try:
+            yield
+        finally:
+            self.configure_subprocess_exit_count += 1
+            if old_value is None:
+                os.environ.pop("LD_PRELOAD", None)
+            else:
+                os.environ["LD_PRELOAD"] = old_value
+
+
 class WeightMemorySaverTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self._saved_env = {
@@ -74,10 +96,14 @@ class WeightMemorySaverTestBase(unittest.TestCase):
 
     def _inject_fake_tms(self) -> _FakeTms:
         fake = _FakeTms()
-        module = types.ModuleType(_TMS_MODULE)
-        module.torch_memory_saver = fake  # type: ignore[attr-defined]
+        module = _FakeTorchMemorySaverModule(fake)
         sys.modules[_TMS_MODULE] = module
         return fake
+
+    def _get_fake_module(self) -> _FakeTorchMemorySaverModule:
+        module = sys.modules[_TMS_MODULE]
+        self.assertIsInstance(module, _FakeTorchMemorySaverModule)
+        return module  # type: ignore[return-value]
 
     def _make_tms_unimportable(self) -> None:
         # A None entry in sys.modules makes `import torch_memory_saver`
@@ -115,6 +141,15 @@ class DefaultDisabledTest(WeightMemorySaverTestBase):
         self.assertFalse(wms.is_paused())
         self.assertEqual(fake.pause_calls, [])
         self.assertEqual(fake.resume_calls, [])
+
+    def test_configure_subprocess_disabled_is_noop(self) -> None:
+        self._inject_fake_tms()
+        module = self._get_fake_module()
+        with wms.configure_subprocess():
+            self.assertNotEqual(
+                os.environ.get("LD_PRELOAD"), "fake_torch_memory_saver_preload.so"
+            )
+        self.assertEqual(module.configure_subprocess_enter_count, 0)
 
     def test_explicit_zero_is_disabled(self) -> None:
         os.environ[wms.ENV_SWITCH] = "0"
@@ -165,6 +200,15 @@ class UnavailableTest(WeightMemorySaverTestBase):
         # Second call must not re-attempt the import (no second warning).
         self.assertFalse(wms.is_available())
 
+    def test_configure_subprocess_unavailable_is_noop(self) -> None:
+        with self.assertLogs(level="WARNING") as logs:
+            with wms.configure_subprocess():
+                self.assertNotEqual(
+                    os.environ.get("LD_PRELOAD"),
+                    "fake_torch_memory_saver_preload.so",
+                )
+        self.assertTrue(any("configure_subprocess" in m for m in logs.output))
+
 
 class FakeTmsForwardingTest(WeightMemorySaverTestBase):
     """Env switch on + fake torch_memory_saver: verify call forwarding."""
@@ -177,6 +221,17 @@ class FakeTmsForwardingTest(WeightMemorySaverTestBase):
     def test_is_available(self) -> None:
         self.assertTrue(wms.is_enabled())
         self.assertTrue(wms.is_available())
+
+    def test_configure_subprocess_forwards_and_restores_env(self) -> None:
+        module = self._get_fake_module()
+        old_value = os.environ.get("LD_PRELOAD")
+        with wms.configure_subprocess():
+            self.assertEqual(
+                os.environ.get("LD_PRELOAD"), "fake_torch_memory_saver_preload.so"
+            )
+        self.assertEqual(module.configure_subprocess_enter_count, 1)
+        self.assertEqual(module.configure_subprocess_exit_count, 1)
+        self.assertEqual(os.environ.get("LD_PRELOAD"), old_value)
 
     def test_region_params(self) -> None:
         with wms.weights_region():

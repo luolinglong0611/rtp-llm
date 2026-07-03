@@ -134,6 +134,36 @@ def is_available() -> bool:
     return _get_tms() is not None
 
 
+@contextmanager
+def configure_subprocess() -> Iterator[None]:
+    """Inject torch_memory_saver into child processes only when sleep mode is on.
+
+    This mirrors torch_memory_saver's own subprocess helper while preserving
+    the no-op behavior used by normal startup paths. The parent process keeps
+    its environment unchanged after the child has been spawned.
+    """
+    if not is_enabled():
+        yield
+        return
+
+    try:
+        from torch_memory_saver import (
+            configure_subprocess as tms_configure_subprocess,  # type: ignore[import-not-found]
+        )
+    except Exception:
+        logging.warning(
+            f"WeightMemorySaver: {ENV_SWITCH}=1 or {LEGACY_ENV_SWITCH}=1 but "
+            "torch_memory_saver.configure_subprocess is not importable; "
+            "subprocess starts without memory saver preload",
+            exc_info=True,
+        )
+        yield
+        return
+
+    with tms_configure_subprocess():
+        yield
+
+
 def is_paused() -> bool:
     """Whether the weights region is currently paused (physical pages released)."""
     return _paused
