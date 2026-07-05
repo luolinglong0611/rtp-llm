@@ -92,7 +92,6 @@ requirement([
     "thrift",
     "torch",
     "torchvision",
-    "torch_memory_saver",
     "triton",
     "numpy",
     "safetensors",
@@ -131,6 +130,15 @@ requirement([
     "fastsafetensors",
     "pybind11_stubgen",
 ] + deep + flashinfer_with_cache + flashmla + rtp_kernel + flashattn)
+
+py_library(
+    name = "torch_memory_saver",
+    deps = select({
+        "@//:using_cuda12_9_x86": ["@pip_gpu_cuda12_9_torch//torch_memory_saver:pkg"],
+        "@//:cuda_pre_12_9": ["@pip_gpu_cuda12_torch//torch_memory_saver:pkg"],
+        "//conditions:default": [],
+    }),
+)
 
 
 py_library(
