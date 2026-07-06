@@ -86,19 +86,16 @@ class ModelLoader:
     @timer_wrapper(description="load weights")
     @torch.inference_mode()
     def load_weights(self, device: str):
-        # Sleep/wake_up M6: register every weight GPU allocation (incl. quant
-        # scales/zeros, dynamic weights and static EPLB buffers) as pausable
-        # cpu-backup memory. No-op unless sleep mode is enabled.
-        with weights_region():
-            if self._load_config.is_ft_style_weight:
-                weights = self._load_from_ft_style(device)
-            else:
-                weights = self._load_weight(device)
-                self.force_clean_cuda_memory()
+        if self._load_config.is_ft_style_weight:
+            weights = self._load_from_ft_style(device)
+        else:
+            weights = self._load_weight(device)
+            self.force_clean_cuda_memory()
 
-            # load dynamic weight
+        # Dynamic lm_head/positional weights and static EPLB buffers may
+        # allocate new GPU tensors outside WeightModule.load().
+        with weights_region():
             self._load_dynamic_weights(weights, device)
-            # load eplb weight
             self._init_eplb_weight(weights, device)
         return weights
 
@@ -396,6 +393,7 @@ class ModelLoader:
             device,
             True,
             stacked_key_config=stacked_key_config,
+            allocation_context=weights_region,
         )
 
         _inline_count = 0

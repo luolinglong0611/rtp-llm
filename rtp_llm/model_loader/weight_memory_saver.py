@@ -22,11 +22,14 @@ no-op so production startup paths are unaffected.
 Coverage checklist (weight tensors that must land inside ``weights_region``)
 ----------------------------------------------------------------------------
 - [covered] Main ``ModelWeights`` incl. quantization scales/zeros:
-  ``ModelLoader.load_weights`` (loader.py) wraps ft-style / fastsafetensors /
-  scratch loading, dynamic weights (lm_head etc.) and static EPLB init
-  (``_init_eplb_weight``); ``WeightModule.load`` / ``WeightModule.update``
-  (weight_module.py) wrap the final ``.to(device)`` landing point for every
-  atomic/composite/quant weight regardless of caller.
+  ``ModelLoader.load_weights`` (loader.py) keeps checkpoint-reader temporary
+  buffers outside the TMS region, and wraps dynamic weights (lm_head etc.) plus
+  static EPLB init (``_init_eplb_weight``).
+  The fastsafetensors iterator enters ``weights_region`` only after
+  ``ParallelLoader`` / ``LoadWithShm`` construction so persistent tensors are
+  tagged without registering pinned staging buffers. ``WeightModule.load`` /
+  ``WeightModule.update`` (weight_module.py) wrap the final ``.to(device)``
+  landing point for every atomic/composite/quant weight regardless of caller.
 - [covered] Multimodal ViT (``mm_part``): ``BaseMultiModalMixin.__init__``
   (rtp_llm/multimodal/multimodal_mixins/base_multimodal_mixin.py) wraps both
   the module construction on device and the checkpoint weight load
