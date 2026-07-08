@@ -15,8 +15,6 @@
 #include "rtp_llm/cpp/engine_base/WeightsConverter.h"
 #include "rtp_llm/cpp/pybind/PyUtils.h"
 #include "rtp_llm/cpp/models/models_weight/W.h"
-#include "rtp_llm/cpp/utils/Logger.h"
-#include <pybind11/stl.h>
 
 using namespace std;
 namespace th = torch;
