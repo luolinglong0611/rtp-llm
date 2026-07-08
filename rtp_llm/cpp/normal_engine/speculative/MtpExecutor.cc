@@ -16,19 +16,16 @@
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "autil/TimeUtility.h"
-#if USING_CUDA
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
-#endif
 #include <algorithm>
 #include <memory>
+#include <thread>
 #include <random>
 
 namespace rtp_llm {
 
 namespace {
 
-// Post-rejection spec-logits cap for grammar/think MTP verify. Keep this on the
+// Post-rejection spec-logits cap for grammar MTP verify. Keep this on the
 // CPU/vector SpeculativeSamplerOutput path to avoid the broader GPU output refactor.
 void applySpecLogitsCap(SpecLogitsVerifyRunner::LaunchResult&  spec_logits_result,
                         const SamplerOutput&                   target_sampler_output,
@@ -599,8 +596,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     RtpLLMTokenPSMetricsCollector&           tps_collector       = metrics_collector.tps_collector;
     RtpLLMSpeculativeEngineMetricsCollector& sp_engine_collector = metrics_collector.sp_engine_collector;
 
-    StreamGroups stream_groups(streams);
-
+    StreamGroups    stream_groups(streams);
     GptModelInputs  model_input;
     GptModelOutputs model_output;
     SamplerOutput   sampler_output;
@@ -723,21 +719,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         }
     }
 
-    if (isTpRank0() && !warm_up_ && !model_input.is_fake_stream) {
-        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_logits_verify)");
-        torch::Tensor draft_tokens;
-        if (propose_step_ == 1) {
-            if (draft_sampler_output.token_ids.defined() && draft_sampler_output.token_ids.numel() > 0) {
-                draft_tokens = draft_sampler_output.token_ids;
-            } else {
-                draft_tokens = model_input.combo_tokens.reshape(
-                    {static_cast<int64_t>(streams.size()), static_cast<int64_t>(propose_step_ + 1)});
-            }
-        } else {
-            draft_tokens = draft_token_ids_t;
-        }
-        spec_logits_result = runSpecLogitsVerify(streams, draft_tokens);
-    }
+    spec_logits_result = runSpecLogitsVerifyIfNeeded(streams, model_input, draft_sampler_output, draft_token_ids_t);
 
     // eplb
     if (expert_balancer_) {
@@ -765,6 +747,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             sampler_output.all_probs = sampler_output.all_probs.reshape(
                 {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
 
+            // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
             applySpecLogitsCap(spec_logits_result,
                                sampler_output,
@@ -772,6 +755,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                static_cast<int64_t>(batch_size),
                                static_cast<int64_t>(propose_step_));
         }
+        // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
     }
@@ -841,7 +825,6 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             stream_groups,
             speculative_sampler_output,
             {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)});
-
         // clean holder tensors from grpc
         for (auto& stream : streams) {
             stream->getSPOutputBuffer()->tensors_holder.clear();
@@ -902,6 +885,7 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
     std::list<GenerateStreamPtr> prefill_streams;
     std::list<GenerateStreamPtr> decode_streams;
 
+    // prepare streams
     prepareStreams(streams, prefill_streams, decode_streams);
 
     // step forward
@@ -912,8 +896,6 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams) {
     }
 
     if (role_type_ == RoleType::DECODE || role_type_ == RoleType::PDFUSION) {
-        // decodeStep handles the empty-batch control path: TP non-root ranks
-        // rely on its skip_run broadcast to keep collectives matched.
         THROW_IF_STATUS_ERROR(decodeStep(decode_streams, metrics_collector));
     }
 
@@ -1069,6 +1051,27 @@ MtpExecutor::runSpecLogitsVerify(const std::list<GenerateStreamPtr>& streams, co
         ++stream_idx;
     }
     return spec_logits_verify_runner_.run(task);
+}
+
+SpecLogitsVerifyRunner::LaunchResult
+MtpExecutor::runSpecLogitsVerifyIfNeeded(const std::list<GenerateStreamPtr>& streams,
+                                         const GptModelInputs&              model_input,
+                                         const SamplerOutput&               draft_sampler_output,
+                                         const torch::Tensor&               draft_token_ids) {
+    if (!isTpRank0() || warm_up_ || model_input.is_fake_stream) {
+        return {};
+    }
+
+    RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_logits_verify)");
+    if (propose_step_ != 1) {
+        return runSpecLogitsVerify(streams, draft_token_ids);
+    }
+    if (draft_sampler_output.token_ids.defined() && draft_sampler_output.token_ids.numel() > 0) {
+        return runSpecLogitsVerify(streams, draft_sampler_output.token_ids);
+    }
+    auto draft_tokens = model_input.combo_tokens.reshape(
+        {static_cast<int64_t>(streams.size()), static_cast<int64_t>(propose_step_ + 1)});
+    return runSpecLogitsVerify(streams, draft_tokens);
 }
 
 }  // namespace rtp_llm
