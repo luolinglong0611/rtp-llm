@@ -113,6 +113,24 @@ def _make_rope_attn_configs(
     return cfg
 
 
+def _make_mrope_attn_configs(
+    head_num: int,
+    head_num_kv: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    tokens_per_block: int = 16,
+):
+    cfg = _make_rope_attn_configs(
+        head_num, head_num_kv, head_dim, dtype, tokens_per_block
+    )
+    cfg.rope_config.style = RopeStyle.Mrope
+    cfg.rope_config.index_factor = 4
+    cfg.rope_config.mrope_dim1 = head_dim // 4
+    cfg.rope_config.mrope_dim2 = head_dim // 4
+    cfg.rope_config.mrope_dim3 = head_dim // 2
+    return cfg
+
+
 def _make_rope_prefill_inputs(
     input_lengths: List[int], device: torch.device, dtype: torch.dtype
 ):
@@ -146,6 +164,21 @@ def _make_rope_prefill_inputs(
     attn_inputs.padding_offset = torch.tensor(
         padding_offset, dtype=torch.int32, device=device
     )
+    return attn_inputs
+
+
+def _make_mrope_prefill_inputs(
+    input_lengths: List[int], device: torch.device, dtype: torch.dtype
+):
+    attn_inputs = _make_rope_prefill_inputs(input_lengths, device, dtype)
+    total_tokens = sum(input_lengths)
+    position_ids = torch.zeros(4, total_tokens, dtype=torch.int32, device=device)
+    cursor = 0
+    for seq_len in input_lengths:
+        positions = torch.arange(seq_len, dtype=torch.int32, device=device)
+        position_ids[:, cursor : cursor + seq_len] = positions
+        cursor += seq_len
+    attn_inputs.combo_position_ids = position_ids.contiguous()
     return attn_inputs
 
 
@@ -1280,6 +1313,35 @@ class TestAiterPrefillImplNoKvRopeRealOp(unittest.TestCase):
 
     def test_nonasm_no_kv_rope_real_op_matches_reference(self):
         self._check_real_no_kv_rope_path(AiterPrefillImplNonAsm)
+
+
+@unittest.skipUnless(_is_rocm(), "Requires ROCm GPU")
+@unittest.skipUnless(_AITER_AVAILABLE, "Requires aiter")
+@unittest.skipUnless(_OPS_IMPORTABLE, "Requires ROCm attention wrapper module")
+class TestAiterPrefillImplMropePositionIds(unittest.TestCase):
+    def setUp(self):
+        self.device = torch.device("cuda")
+        self.dtype = torch.bfloat16
+
+    def _check_mrope_accepts_combo_position_ids(self, impl_cls):
+        cfg = _make_mrope_attn_configs(
+            head_num=4,
+            head_num_kv=2,
+            head_dim=64,
+            dtype=self.dtype,
+        )
+        attn_inputs = _make_mrope_prefill_inputs([5, 3], self.device, self.dtype)
+
+        impl = impl_cls(cfg, attn_inputs)
+
+        self.assertTrue(impl.rope_params.position_ids.defined())
+        self.assertEqual(impl.rope_params.position_ids.numel(), 4 * 8)
+
+    def test_asm_mrope_accepts_combo_position_ids(self):
+        self._check_mrope_accepts_combo_position_ids(AiterPrefillImplAsm)
+
+    def test_nonasm_mrope_accepts_combo_position_ids(self):
+        self._check_mrope_accepts_combo_position_ids(AiterPrefillImplNonAsm)
 
 
 if __name__ == "__main__":

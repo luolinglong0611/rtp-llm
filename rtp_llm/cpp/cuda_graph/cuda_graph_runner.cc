@@ -146,6 +146,29 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
     tryAddStridedD2DCopy(inputs.attention_inputs.kv_cache_kernel_block_id_device,
                          py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device);
 
+    if (inputs.combo_position_ids.defined() && inputs.combo_position_ids.numel() > 0
+        && inputs.combo_position_ids.has_storage()) {
+        if (!py_model_inputs_.combo_position_ids.defined()) {
+            RTP_LLM_LOG_WARNING("combo_position_ids not defined in graph but present in input, skipping copy");
+        } else {
+            const size_t copy_numel = is_prefill_cuda_graph_mode_ ?
+                                          static_cast<size_t>(state.current_seq_len) * position_id_len_factor_ :
+                                          static_cast<size_t>(inputs.combo_position_ids.numel());
+            const size_t copy_size  = copy_numel * inputs.combo_position_ids.element_size();
+            const size_t src_size   = inputs.combo_position_ids.numel() * inputs.combo_position_ids.element_size();
+            const size_t dst_size =
+                py_model_inputs_.combo_position_ids.numel() * py_model_inputs_.combo_position_ids.element_size();
+            if (src_size >= copy_size && dst_size >= copy_size) {
+                optimizedCopyAsync(inputs.combo_position_ids, py_model_inputs_.combo_position_ids, copy_size);
+            } else {
+                RTP_LLM_LOG_WARNING("combo_position_ids copy skipped: src bytes (%zu), dst bytes (%zu), needed (%zu)",
+                                    src_size,
+                                    dst_size,
+                                    copy_size);
+            }
+        }
+    }
+
     if (!is_prefill_cuda_graph_mode_) {
         // D2D copies — collected for single batched kernel launch
         tryAddD2DCopy(inputs.attention_inputs.prefix_lengths_device,
@@ -157,23 +180,6 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
         tryAddD2DCopy(inputs.attention_inputs.decode_cu_seqlens_device,
                       py_model_inputs_.attention_inputs.decode_cu_seqlens_device,
                       (state.current_batch_size + 1) * sizeof(int));
-
-        if (inputs.combo_position_ids.defined() && inputs.combo_position_ids.numel() > 0
-            && inputs.combo_position_ids.has_storage()) {
-            if (!py_model_inputs_.combo_position_ids.defined()) {
-                RTP_LLM_LOG_WARNING("combo_position_ids not defined in graph but present in input, skipping copy");
-            } else {
-                size_t copy_size = inputs.combo_position_ids.numel() * sizeof(int);
-                if (py_model_inputs_.combo_position_ids.numel() * sizeof(int) >= copy_size) {
-                    optimizedCopyAsync(inputs.combo_position_ids, py_model_inputs_.combo_position_ids, copy_size);
-                } else {
-                    RTP_LLM_LOG_WARNING(
-                        "combo_position_ids target tensor size (%zu) is smaller than needed (%zu), skipping copy",
-                        py_model_inputs_.combo_position_ids.numel() * sizeof(int),
-                        copy_size);
-                }
-            }
-        }
     } else {
         // D2D copy
         if (inputs.bert_embedding_inputs.position_encoding.numel() > 0) {
