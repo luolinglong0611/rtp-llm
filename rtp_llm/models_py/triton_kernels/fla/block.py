@@ -5,6 +5,11 @@ import triton.language as tl
 from rtp_llm.models_py.triton_kernels.fla.index import prepare_chunk_indices
 
 
+@triton.jit
+def _linear_offset_64(index, stride):
+    return index.to(tl.int64) * stride
+
+
 @triton.jit(do_not_specialize=["max_block_size"])
 def load_initial_state_from_block_map_kernel(
     prefix_lengths: tl.tensor,
@@ -132,14 +137,16 @@ def store_ssm_state_to_block_map_kernel(
 
     # last chunk always record to final states
     if (chunk + 1) * CHUNK_SIZE >= input_len:
-        source_ptr = final_states + batch * SSM_PER_BATCH + i_h * SSM_PER_HEAD
+        source_ptr = (
+            final_states + _linear_offset_64(batch, SSM_PER_BATCH) + i_h * SSM_PER_HEAD
+        )
         dest_block_pos = (prefix + input_len - 1) // SEQ_SIZE_PER_BLOCK
         should_write = True
     elif chunk > 0 and (chunk + 1) * CHUNK_SIZE % SEQ_SIZE_PER_BLOCK == 0:
         dest_block_pos = (
             prefix + chunk * CHUNK_SIZE + CHUNK_SIZE - 1
         ) // SEQ_SIZE_PER_BLOCK
-        source_ptr = h + (i_c + 1) * SSM_PER_BATCH + i_h * SSM_PER_HEAD
+        source_ptr = h + _linear_offset_64(i_c + 1, SSM_PER_BATCH) + i_h * SSM_PER_HEAD
         should_write = True
 
     if not should_write:
