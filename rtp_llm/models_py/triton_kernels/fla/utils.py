@@ -18,6 +18,50 @@ logger = logging.getLogger(__name__)
 
 COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
+_TRUE_ENV_VALUES = {"1", "true", "t", "yes", "y", "on"}
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+@lru_cache(maxsize=1)
+def rocm_core_debug_enabled() -> bool:
+    return _env_truthy("RTP_LLM_ROCM_CORE_DEBUG") or _env_truthy("HIP_LAUNCH_BLOCKING")
+
+
+def tensor_debug_summary(name: str, tensor: Any, max_items: int = 16) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    if not isinstance(tensor, torch.Tensor):
+        return f"{name}={tensor!r}"
+
+    parts = [
+        f"{name}: shape={tuple(tensor.shape)}",
+        f"dtype={tensor.dtype}",
+        f"device={tensor.device}",
+        f"numel={tensor.numel()}",
+        f"id={id(tensor)}",
+    ]
+    try:
+        parts.append(f"data_ptr=0x{tensor.data_ptr():x}")
+    except Exception as exc:
+        parts.append(f"data_ptr=<unavailable:{exc}>")
+
+    if tensor.numel() > 0:
+        try:
+            flat = tensor.detach().flatten()
+            sample = flat[: min(max_items, flat.numel())].cpu().tolist()
+            parts.append(f"values[:{max_items}]={sample}")
+        except Exception as exc:
+            parts.append(f"values=<unavailable:{exc}>")
+    return ", ".join(parts)
+
+
+def _debug_arg_summary(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
+    arg_parts = [tensor_debug_summary(f"arg{i}", arg) for i, arg in enumerate(args)]
+    kw_parts = [tensor_debug_summary(key, value) for key, value in kwargs.items()]
+    return "; ".join(arg_parts + kw_parts)
 
 
 @lru_cache(maxsize=1)
@@ -106,6 +150,7 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal cache_entries, cache_size
+        debug_enabled = rocm_core_debug_enabled()
         for i, entry in enumerate(cache_entries):
             last_args, last_kwargs, last_result = entry
             if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
@@ -117,9 +162,24 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                         + cache_entries[i + 1 :]
                         + [(args, kwargs, last_result)]
                     )
+                    if debug_enabled:
+                        logger.warning(
+                            "[ROCM_CORE_DEBUG][FLA tensor_cache] hit fn=%s key=(%s) result=(%s)",
+                            fn.__name__,
+                            _debug_arg_summary(args, kwargs),
+                            tensor_debug_summary("result", last_result),
+                        )
                     return last_result
 
         result = fn(*args, **kwargs)
+
+        if debug_enabled:
+            logger.warning(
+                "[ROCM_CORE_DEBUG][FLA tensor_cache] miss fn=%s key=(%s) result=(%s)",
+                fn.__name__,
+                _debug_arg_summary(args, kwargs),
+                tensor_debug_summary("result", result),
+            )
 
         if len(cache_entries) >= cache_size:
             cache_entries = cache_entries[1:]

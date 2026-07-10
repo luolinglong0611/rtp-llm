@@ -14,6 +14,9 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <algorithm>
+#include <cctype>
+#include <sstream>
 #include "rtp_llm/cpp/utils/DevicePerfWrapper.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #if USING_CUDA
@@ -23,6 +26,93 @@
 using namespace std;
 
 namespace rtp_llm {
+
+namespace {
+
+bool envTruthy(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s == "1" || s == "true" || s == "t" || s == "yes" || s == "y" || s == "on";
+}
+
+bool rocmCoreDebugEnabled() {
+    static const bool enabled = envTruthy("RTP_LLM_ROCM_CORE_DEBUG") || envTruthy("HIP_LAUNCH_BLOCKING");
+    return enabled;
+}
+
+std::string
+tensorSummary(const char* name, const torch::Tensor& tensor, bool include_values = true, int64_t max_items = 16) {
+    std::ostringstream ss;
+    ss << name << ": ";
+    if (!tensor.defined()) {
+        ss << "<undefined>";
+        return ss.str();
+    }
+    ss << "shape=[";
+    for (int i = 0; i < tensor.dim(); ++i) {
+        if (i != 0) {
+            ss << ",";
+        }
+        ss << tensor.size(i);
+    }
+    ss << "], dtype=" << tensor.scalar_type() << ", device=" << tensor.device() << ", numel=" << tensor.numel();
+    try {
+        ss << ", data_ptr=0x" << std::hex << reinterpret_cast<uintptr_t>(tensor.data_ptr()) << std::dec;
+    } catch (const std::exception& e) {
+        ss << ", data_ptr=<unavailable:" << e.what() << ">";
+    }
+    if (include_values && tensor.numel() > 0) {
+        try {
+            auto flat   = tensor.detach().flatten();
+            auto sample = flat.slice(0, 0, std::min<int64_t>(flat.numel(), max_items)).to(torch::kCPU);
+            ss << ", values[:" << max_items << "]=" << sample;
+        } catch (const std::exception& e) {
+            ss << ", values=<unavailable:" << e.what() << ">";
+        }
+    }
+    return ss.str();
+}
+
+std::string gptModelInputsSummary(const GptModelInputs& inputs) {
+    std::ostringstream ss;
+    ss << tensorSummary("combo_tokens", inputs.combo_tokens) << "; "
+       << tensorSummary("input_lengths", inputs.input_lengths) << "; "
+       << tensorSummary("sequence_lengths", inputs.sequence_lengths) << "; "
+       << tensorSummary("prefix_lengths", inputs.prefix_lengths) << "; "
+       << tensorSummary("request_id", inputs.request_id) << "; "
+       << tensorSummary("request_pd_separation", inputs.request_pd_separation)
+       << "; pd_separation=" << inputs.pd_separation << "; decode_entrance=" << inputs.decode_entrance
+       << "; warmup=" << inputs.warmup << "; is_target_verify=" << inputs.is_target_verify
+       << "; need_all_logits=" << inputs.need_all_logits;
+    return ss.str();
+}
+
+std::string pyAttentionInputsSummary(const torch_ext::PyAttentionInputs& inputs, bool include_device_values) {
+    std::ostringstream ss;
+    ss << "is_prefill=" << inputs.is_prefill << "; is_target_verify=" << inputs.is_target_verify
+       << "; is_cuda_graph=" << inputs.is_cuda_graph << "; has_cache_store=" << inputs.cache_store_inputs.has_value()
+       << "; context_total_kv_length=" << inputs.context_total_kv_length << "; total_tokens=" << inputs.total_tokens
+       << "; " << tensorSummary("input_lengths", inputs.input_lengths) << "; "
+       << tensorSummary("prefix_lengths", inputs.prefix_lengths) << "; "
+       << tensorSummary("sequence_lengths", inputs.sequence_lengths) << "; "
+       << tensorSummary("cu_seqlens", inputs.cu_seqlens) << "; "
+       << tensorSummary("cu_seqlens_device", inputs.cu_seqlens_device, include_device_values) << "; "
+       << tensorSummary("cu_kv_seqlens_device", inputs.cu_kv_seqlens_device, include_device_values) << "; "
+       << tensorSummary("prefix_lengths_device", inputs.prefix_lengths_device, include_device_values) << "; "
+       << tensorSummary("input_lengths_device", inputs.input_lengths_device, include_device_values) << "; "
+       << tensorSummary("sequence_lengths_plus_1_device", inputs.sequence_lengths_plus_1_device, include_device_values)
+       << "; " << tensorSummary("decode_cu_seqlens_device", inputs.decode_cu_seqlens_device, include_device_values)
+       << "; "
+       << tensorSummary(
+              "kv_cache_kernel_block_id_device", inputs.kv_cache_kernel_block_id_device, include_device_values);
+    return ss.str();
+}
+
+}  // namespace
 
 torch::Tensor PyWrappedModel::tensorHoldHostAndToCuda(const torch::Tensor& tensor) {
     if (tensor.device().is_cuda()) {
@@ -138,7 +228,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
 
         py_attn_inputs.context_total_kv_length = cu_kv_seqlens[context_batch_size].item<int>();
         py_attn_inputs.total_tokens            = cu_seqlens[batch_size].item<int>();
-        py_attn_inputs.cu_seqlens         = cu_seqlens;
+        py_attn_inputs.cu_seqlens              = cu_seqlens;
         py_attn_inputs.cu_seqlens_device       = tensorHoldHostAndToCuda(cu_seqlens);
         py_attn_inputs.cu_kv_seqlens_device    = tensorHoldHostAndToCuda(cu_kv_seqlens);
     } else {
@@ -154,7 +244,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
                           py_attn_inputs.sequence_lengths.size(0) + 1,
                           1,
                           torch::TensorOptions(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-        py_attn_inputs.decode_cu_seqlens   = decode_cu_seqlens;
+        py_attn_inputs.decode_cu_seqlens        = decode_cu_seqlens;
         py_attn_inputs.decode_cu_seqlens_device = tensorHoldHostAndToCuda(decode_cu_seqlens);
     }
 
@@ -169,6 +259,13 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     } else {
         auto sequence_lengths_plus_1                  = (py_attn_inputs.sequence_lengths + 1).pin_memory();
         py_attn_inputs.sequence_lengths_plus_1_device = tensorHoldHostAndToCuda(sequence_lengths_plus_1);
+    }
+
+    if (rocmCoreDebugEnabled()) {
+        RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] buildPyAttentionInputs created | gpt_inputs={%s} | "
+                            "attention_inputs_pre_fused_copy={%s}",
+                            gptModelInputsSummary(inputs).c_str(),
+                            pyAttentionInputsSummary(py_attn_inputs, false).c_str());
     }
 
     return py_attn_inputs;
@@ -202,7 +299,7 @@ void PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs
     // Legacy 2-D fields default to group 0.
     // NOTE: keep host/device 2-D fields consistent to avoid shape mismatch in CUDA graph replay path.
     py_attn_inputs.kv_cache_kernel_block_id_device = py_attn_inputs.kv_cache_kernel_block_id_device_by_group[0];
-    py_attn_inputs.kv_cache_kernel_block_id   = py_attn_inputs.kv_cache_kernel_block_id_by_group[0];
+    py_attn_inputs.kv_cache_kernel_block_id        = py_attn_inputs.kv_cache_kernel_block_id_by_group[0];
 }
 
 // Helper function to build BertEmbeddingInputs from GptModelInputs
@@ -299,6 +396,10 @@ std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const 
 
 GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs) {
     RTP_LLM_PROFILE_SCOPE("py_model.forwardMicroBatched");
+    if (rocmCoreDebugEnabled()) {
+        RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] forwardMicroBatched begin | inputs={%s}",
+                            gptModelInputsSummary(inputs).c_str());
+    }
 
     // Per-launch capacity contract: see fuse_copy_util.h sizing rationale.
     // d2d_copies_ accumulates across ALL micro-batches before the single
@@ -363,6 +464,15 @@ GptModelOutputs PyWrappedModel::forwardMicroBatched(const GptModelInputs& inputs
     }
 
     fusedCopy(d2d_copies_);
+    if (rocmCoreDebugEnabled()) {
+        for (size_t i = 0; i < input_list.size(); ++i) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] forwardMicroBatched after fusedCopy micro=%lu | "
+                                "input_ids={%s} | attention_inputs={%s}",
+                                i,
+                                tensorSummary("input_ids", input_list[i].input_ids).c_str(),
+                                pyAttentionInputsSummary(input_list[i].attention_inputs, true).c_str());
+        }
+    }
 
     std::vector<PyModelOutputs> py_model_outputs;
     {
@@ -460,6 +570,10 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
     if (pinned_check_remaining_ > 0) {
         --pinned_check_remaining_;
     }
+    if (rocmCoreDebugEnabled()) {
+        RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] forward begin | inputs={%s}",
+                            gptModelInputsSummary(inputs).c_str());
+    }
     try {
         RTP_LLM_LOG_DEBUG("Calling forward method on Python object instance.");
 
@@ -500,6 +614,12 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
 
         // launch fused copy
         fusedCopy(d2d_copies_);
+        if (rocmCoreDebugEnabled()) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] forward after fusedCopy | token_ids={%s} | "
+                                "attention_inputs={%s}",
+                                tensorSummary("token_ids", token_ids).c_str(),
+                                pyAttentionInputsSummary(attention_inputs, true).c_str());
+        }
 
         auto           py_model_inputs = PyModelInputs({token_ids,
                                                         input_hiddens,
@@ -513,7 +633,16 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
 
         // Cast the Python object to PyModelOutputs and extract hidden states
         CudaGraphState graph_state;
-        if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state)) {
+        bool           use_cuda_graph = enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state);
+        if (rocmCoreDebugEnabled()) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] forward graph decision enable_cuda_graph=%d "
+                                "use_cuda_graph=%d is_prefill=%d is_target_verify=%d",
+                                enable_cuda_graph_,
+                                use_cuda_graph,
+                                py_model_inputs.attention_inputs.is_prefill,
+                                py_model_inputs.attention_inputs.is_target_verify);
+        }
+        if (use_cuda_graph) {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
@@ -526,6 +655,11 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             py_model_outputs                             = graph_runner_->forward(py_model_inputs, graph_state);
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] CUDA graph forward completed");
             hidden_states = py_model_outputs.hidden_states.clone();
+            if (rocmCoreDebugEnabled()) {
+                RTP_LLM_LOG_WARNING(
+                    "[ROCM_CORE_DEBUG][PyWrappedModel] forward cuda_graph returned | hidden_states={%s}",
+                    tensorSummary("hidden_states", hidden_states).c_str());
+            }
         } else {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
@@ -538,10 +672,17 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             auto outputs          = py_model_forward(py_model_inputs, held_attn_pyobj_);
             py_model_outputs      = outputs.cast<PyModelOutputs>();
             hidden_states         = py_model_outputs.hidden_states.clone();
+            if (rocmCoreDebugEnabled()) {
+                RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] forward normal returned | hidden_states={%s}",
+                                    tensorSummary("hidden_states", hidden_states).c_str());
+            }
         }
 
         if (!inputs.warmup && inputs.pd_separation) {
             cache_store_async_writer_->waitAllDone();
+            if (rocmCoreDebugEnabled()) {
+                RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][PyWrappedModel] forward cache_store waitAllDone end");
+            }
         }
 
         RTP_LLM_LOG_DEBUG("Python object instance forward method called successfully.");
@@ -552,12 +693,24 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         return callForwardPostLayers(hidden_states, inputs, true);
 
     } catch (const py::error_already_set& e) {
+        if (rocmCoreDebugEnabled()) {
+            RTP_LLM_LOG_ERROR("[ROCM_CORE_DEBUG][PyWrappedModel] Python exception during forward | inputs={%s}",
+                              gptModelInputsSummary(inputs).c_str());
+        }
         RTP_LLM_LOG_ERROR("Python error during forward call on Python instance: %s", e.what());
         throw std::runtime_error(std::string("pybind11 error during forward call on Python instance: ") + e.what());
     } catch (const std::exception& e) {
+        if (rocmCoreDebugEnabled()) {
+            RTP_LLM_LOG_ERROR("[ROCM_CORE_DEBUG][PyWrappedModel] C++ exception during forward | inputs={%s}",
+                              gptModelInputsSummary(inputs).c_str());
+        }
         RTP_LLM_LOG_ERROR("C++ error during forward call on Python instance: %s", e.what());
         throw std::runtime_error(std::string("C++ error during forward call on Python instance: ") + e.what());
     } catch (...) {
+        if (rocmCoreDebugEnabled()) {
+            RTP_LLM_LOG_ERROR("[ROCM_CORE_DEBUG][PyWrappedModel] unknown exception during forward | inputs={%s}",
+                              gptModelInputsSummary(inputs).c_str());
+        }
         RTP_LLM_LOG_ERROR("An unknown error occurred during forward call on Python instance.");
         throw std::runtime_error("An unknown error occurred during forward call on Python instance.");
     }

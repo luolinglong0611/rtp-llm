@@ -1,7 +1,12 @@
 #include "rtp_llm/models_py/bindings/core/OpData.h"
 #include "rtp_llm/models_py/bindings/core/CommonDefines.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
 #include <limits>
+#include <sstream>
 
 #if USING_CUDA
 #include <ATen/cuda/CUDAContext.h>
@@ -22,6 +27,79 @@ using namespace std;
 namespace rtp_llm {
 
 namespace {
+
+bool envTruthy(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s == "1" || s == "true" || s == "t" || s == "yes" || s == "y" || s == "on";
+}
+
+bool rocmCoreDebugEnabled() {
+    static const bool enabled = envTruthy("RTP_LLM_ROCM_CORE_DEBUG") || envTruthy("HIP_LAUNCH_BLOCKING");
+    return enabled;
+}
+
+uint64_t nextSampleDebugId() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string
+tensorSummary(const char* name, const torch::Tensor& tensor, bool include_values = true, int64_t max_items = 16) {
+    std::ostringstream ss;
+    ss << name << ": ";
+    if (!tensor.defined()) {
+        ss << "<undefined>";
+        return ss.str();
+    }
+    ss << "shape=[";
+    for (int i = 0; i < tensor.dim(); ++i) {
+        if (i != 0) {
+            ss << ",";
+        }
+        ss << tensor.size(i);
+    }
+    ss << "], dtype=" << tensor.scalar_type() << ", device=" << tensor.device() << ", numel=" << tensor.numel();
+    try {
+        ss << ", data_ptr=0x" << std::hex << reinterpret_cast<uintptr_t>(tensor.data_ptr()) << std::dec;
+    } catch (const std::exception& e) {
+        ss << ", data_ptr=<unavailable:" << e.what() << ">";
+    }
+    if (include_values && tensor.numel() > 0) {
+        try {
+            auto flat   = tensor.detach().flatten();
+            auto sample = flat.slice(0, 0, std::min<int64_t>(flat.numel(), max_items)).to(torch::kCPU);
+            ss << ", values[:" << max_items << "]=" << sample;
+        } catch (const std::exception& e) {
+            ss << ", values=<unavailable:" << e.what() << ">";
+        }
+    }
+    return ss.str();
+}
+
+std::string tensorStatsSummary(const char* name, const torch::Tensor& tensor) {
+    std::ostringstream ss;
+    ss << tensorSummary(name, tensor, false);
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return ss.str();
+    }
+    try {
+        auto finite_count = at::isfinite(tensor).sum().item<int64_t>();
+        auto nan_count    = at::isnan(tensor).sum().item<int64_t>();
+        auto inf_count    = at::isinf(tensor).sum().item<int64_t>();
+        auto neg_count    = (tensor < 0).sum().item<int64_t>();
+        ss << ", finite_count=" << finite_count << ", nan_count=" << nan_count << ", inf_count=" << inf_count
+           << ", negative_count=" << neg_count << ", min=" << tensor.min().item<float>()
+           << ", max=" << tensor.max().item<float>();
+    } catch (const std::exception& e) {
+        ss << ", stats=<unavailable:" << e.what() << ">";
+    }
+    return ss.str();
+}
 
 struct RejectionSamplingLaunchConfig {
     int batch_size;
@@ -439,6 +517,27 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     const auto step               = params.step;
     const auto decoder_batch_size = params.sequence_lengths.size(0);
     auto       cur_stream         = at::hip::getCurrentHIPStream().stream();
+    const bool debug_enabled      = rocmCoreDebugEnabled();
+    const auto debug_id           = debug_enabled ? nextSampleDebugId() : 0;
+
+    if (debug_enabled) {
+        RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] begin id=%lu batch=%ld decoder_batch=%ld vocab=%ld step=%lu | "
+                            "%s | %s | %s | %s | %s | %s | %s",
+                            debug_id,
+                            batch_size,
+                            decoder_batch_size,
+                            vocab_size_padded,
+                            step,
+                            tensorStatsSummary("logits", params.logits).c_str(),
+                            tensorSummary("input_lengths", params.input_lengths).c_str(),
+                            tensorSummary("sequence_lengths", params.sequence_lengths).c_str(),
+                            tensorSummary("token_ids", params.token_ids).c_str(),
+                            tensorSummary("top_k", params.top_k).c_str(),
+                            tensorSummary("top_p", params.top_p).c_str(),
+                            params.do_sample.has_value() ?
+                                tensorSummary("do_sample", params.do_sample.value()).c_str() :
+                                "do_sample=<unset>");
+    }
 
     // [batch_size, step + 1] — clone to GPU
     // On ROCm, hipMemcpyAsync from pageable memory is truly async (unlike CUDA where it
@@ -451,6 +550,11 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     if (std::any_of(params.temperature.data_ptr<float>(),
                     params.temperature.data_ptr<float>() + batch_size,
                     [&](auto t) { return t != 1.0f; })) {
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu apply temperature penalty begin | %s",
+                                debug_id,
+                                tensorSummary("temperature", params.temperature).c_str());
+        }
         auto temperature_gpu = params.temperature.to(torch::kCUDA);
         invokeBatchApplyTemperaturePenalty(params.logits.data_ptr<float>(),
                                            (float*)nullptr,  // embedding_bias
@@ -459,6 +563,11 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                                            vocab_size_padded,
                                            vocab_size_padded,
                                            cur_stream);
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu apply temperature penalty end | %s",
+                                debug_id,
+                                tensorStatsSummary("logits", params.logits).c_str());
+        }
     }
 
     // 2. Apply repetition/presence/frequency penalty
@@ -476,6 +585,15 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
             || std::any_of(frequency_penalty.data_ptr<float>(),
                            frequency_penalty.data_ptr<float>() + batch_size,
                            [&](auto t) { return t != 0.0f; })) {
+            if (debug_enabled) {
+                RTP_LLM_LOG_WARNING(
+                    "[ROCM_CORE_DEBUG][Sampler] id=%lu apply repetition/presence/frequency penalty begin "
+                    "| %s | %s | %s",
+                    debug_id,
+                    tensorSummary("repetition_penalty", repetition_penalty).c_str(),
+                    tensorSummary("presence_penalty", presence_penalty).c_str(),
+                    tensorSummary("frequency_penalty", frequency_penalty).c_str());
+            }
             auto sequence_lengths_gpu = params.input_lengths.to(torch::kCUDA);
             if (decoder_batch_size > 0) {
                 auto dst_slice = sequence_lengths_gpu.slice(0, 0, decoder_batch_size);
@@ -499,6 +617,12 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                                               step + 1,  // max_input_length
                                               step + 1,  // step
                                               cur_stream);
+            if (debug_enabled) {
+                RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu apply repetition/presence/frequency penalty end "
+                                    "| %s",
+                                    debug_id,
+                                    tensorStatsSummary("logits", params.logits).c_str());
+            }
         }
     }
 
@@ -506,6 +630,11 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
     auto top_k_ptr = reinterpret_cast<uint32_t*>(params.top_k.data_ptr<int32_t>());
     if (std::all_of(top_k_ptr, top_k_ptr + batch_size, [&](auto t) { return t == 1; })
         && !params.output_all_probs.has_value()) {
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu top_k=1 fast path before argmax | %s",
+                                debug_id,
+                                tensorStatsSummary("logits", params.logits).c_str());
+        }
         torch::Tensor samples_t =
             transposed_tokens.slice(0, transposed_tokens.size(0) - 1, transposed_tokens.size(0)).squeeze(0);
         torch::Tensor probs_t         = params.logits;
@@ -514,13 +643,28 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
 
         auto output_tokens = transposed_tokens.transpose(0, 1).contiguous();
         params.token_ids.copy_(output_tokens);
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu top_k=1 fast path end | %s",
+                                debug_id,
+                                tensorSummary("selected_tokens", selected_tokens).c_str());
+        }
 
         return GreedyOutput{};
     }
 
     // 4. Compute softmax probabilities
+    if (debug_enabled) {
+        RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu softmax begin | %s",
+                            debug_id,
+                            tensorStatsSummary("logits", params.logits).c_str());
+    }
     auto probs_t = torch::softmax(params.logits, -1);
     params.logits.copy_(probs_t);
+    if (debug_enabled) {
+        RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu softmax end | %s",
+                            debug_id,
+                            tensorStatsSummary("probs", probs_t).c_str());
+    }
 
     // 5. Prepare sampling parameters
     constexpr bool deterministic = true;
@@ -551,6 +695,11 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
 
     // 6. Sample
     if (std::all_of(top_k_ptr, top_k_ptr + batch_size, [&](auto t) { return t == 1; })) {
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu sample branch top_k=1 after softmax | %s",
+                                debug_id,
+                                tensorStatsSummary("probs", probs_t).c_str());
+        }
         torch::Tensor selected_tokens = torch::argmax(probs_t, -1, /*keepdim=*/false);
         samples_t.copy_(selected_tokens);
         if (need_renorm_probs) {
@@ -566,6 +715,12 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
         // Apply top_k filtering if needed
         auto filtered_probs = probs_t;
         bool has_top_k      = !std::all_of(top_k_ptr, top_k_ptr + batch_size, [](auto t) { return t <= 0; });
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu multinomial branch begin has_top_k=%d | %s",
+                                debug_id,
+                                has_top_k,
+                                tensorStatsSummary("filtered_probs_before_topk", filtered_probs).c_str());
+        }
         if (has_top_k) {
             for (int64_t b = 0; b < (int64_t)batch_size; b++) {
                 int k = top_k_ptr[b] <= 0 ? vocab_size_padded : top_k_ptr[b];
@@ -576,10 +731,21 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                     row.masked_fill_(row < min_val, 0.0f);
                 }
             }
+            if (debug_enabled) {
+                RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu after top_k filter | %s",
+                                    debug_id,
+                                    tensorStatsSummary("filtered_probs_after_topk", filtered_probs).c_str());
+            }
         }
         // Apply top_p (nucleus) filtering if needed
         bool has_top_p =
             !std::all_of(top_p_ptr, top_p_ptr + batch_size, [](auto t) { return std::abs(t - 1.0f) < 1e-7; });
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu top_p filter decision has_top_p=%d | %s",
+                                debug_id,
+                                has_top_p,
+                                tensorSummary("top_p", params.top_p).c_str());
+        }
         if (has_top_p) {
             for (int64_t b = 0; b < (int64_t)batch_size; b++) {
                 float p = top_p_ptr[b];
@@ -592,12 +758,55 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
                     row.scatter_(0, sorted_indices, sorted_probs);
                 }
             }
+            if (debug_enabled) {
+                RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu after top_p filter | %s",
+                                    debug_id,
+                                    tensorStatsSummary("filtered_probs_after_topp", filtered_probs).c_str());
+            }
         }
         // Re-normalize and sample
         auto row_sums  = filtered_probs.sum(-1, /*keepdim=*/true);
         filtered_probs = filtered_probs / row_sums.clamp_min(1e-10);
-        auto selected  = torch::multinomial(filtered_probs, 1, /*replacement=*/false).squeeze(-1);
+        if (debug_enabled) {
+            try {
+                auto invalid_mask  = at::logical_or(at::logical_not(at::isfinite(filtered_probs)), filtered_probs < 0);
+                auto invalid_rows  = invalid_mask.any(-1);
+                auto row_sums_1d   = row_sums.squeeze(-1);
+                auto bad_sums      = at::logical_or(at::logical_not(at::isfinite(row_sums_1d)), row_sums_1d <= 0);
+                invalid_rows       = at::logical_or(invalid_rows, bad_sums);
+                auto invalid_count = invalid_rows.sum().item<int64_t>();
+                RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu before multinomial | invalid_rows=%ld | %s | "
+                                    "%s | %s",
+                                    debug_id,
+                                    invalid_count,
+                                    tensorStatsSummary("row_sums_before_norm", row_sums).c_str(),
+                                    tensorStatsSummary("filtered_probs_normed", filtered_probs).c_str(),
+                                    tensorSummary("invalid_rows", invalid_rows).c_str());
+                if (invalid_count > 0) {
+                    RTP_LLM_LOG_ERROR("[ROCM_CORE_DEBUG][Sampler] id=%lu invalid probability distribution before "
+                                      "torch::multinomial | %s | %s | %s | %s | %s | %s",
+                                      debug_id,
+                                      tensorStatsSummary("filtered_probs_normed", filtered_probs).c_str(),
+                                      tensorStatsSummary("row_sums_before_norm", row_sums).c_str(),
+                                      tensorSummary("top_k", params.top_k).c_str(),
+                                      tensorSummary("top_p", params.top_p).c_str(),
+                                      tensorSummary("input_lengths", params.input_lengths).c_str(),
+                                      tensorSummary("sequence_lengths", params.sequence_lengths).c_str());
+                }
+            } catch (const std::exception& e) {
+                RTP_LLM_LOG_ERROR("[ROCM_CORE_DEBUG][Sampler] id=%lu failed to inspect probabilities before "
+                                  "torch::multinomial: %s",
+                                  debug_id,
+                                  e.what());
+            }
+        }
+        auto selected = torch::multinomial(filtered_probs, 1, /*replacement=*/false).squeeze(-1);
         samples_t.copy_(selected);
+        if (debug_enabled) {
+            RTP_LLM_LOG_WARNING("[ROCM_CORE_DEBUG][Sampler] id=%lu multinomial returned | %s",
+                                debug_id,
+                                tensorSummary("selected", selected).c_str());
+        }
         if (need_renorm_probs) {
             output_all_probs_t.copy_(filtered_probs);
         }

@@ -45,6 +45,10 @@ from rtp_llm.models_py.triton_kernels.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
 from rtp_llm.models_py.triton_kernels.fla.gdn_gating import fused_gdn_gating
+from rtp_llm.models_py.triton_kernels.fla.utils import rocm_core_debug_enabled
+from rtp_llm.models_py.triton_kernels.fla.utils import (
+    tensor_debug_summary as _tensor_debug_summary,
+)
 from rtp_llm.models_py.utils.debug import cudagraph_debug_kernel
 from rtp_llm.models_py.utils.typed_storage_view import LinearCacheConverter
 from rtp_llm.ops import (
@@ -61,6 +65,41 @@ from rtp_llm.ops.compute_ops import (
 )
 from rtp_llm.utils.model_weight import W
 from rtp_llm.utils.util import to_torch_dtype
+
+logger = logging.getLogger(__name__)
+
+
+def tensor_debug_summary(name: str, tensor: Any, max_items: int = 16) -> str:
+    if not rocm_core_debug_enabled():
+        return ""
+    return _tensor_debug_summary(name, tensor, max_items)
+
+
+def _core_debug(message: str, *args: Any) -> None:
+    if rocm_core_debug_enabled():
+        logger.warning("[ROCM_CORE_DEBUG][qwen3_next] " + message, *args)
+
+
+def _attention_inputs_debug_summary(attn_inputs: PyAttentionInputs) -> str:
+    return "; ".join(
+        [
+            f"is_prefill={attn_inputs.is_prefill}",
+            f"is_target_verify={attn_inputs.is_target_verify}",
+            f"is_cuda_graph={getattr(attn_inputs, 'is_cuda_graph', False)}",
+            f"has_cache_store={attn_inputs.cache_store_inputs is not None}",
+            tensor_debug_summary("input_lengths", attn_inputs.input_lengths),
+            tensor_debug_summary("prefix_lengths", attn_inputs.prefix_lengths),
+            tensor_debug_summary("sequence_lengths", attn_inputs.sequence_lengths),
+            tensor_debug_summary("cu_seqlens_device", attn_inputs.cu_seqlens_device),
+            tensor_debug_summary(
+                "prefix_lengths_device", attn_inputs.prefix_lengths_device
+            ),
+            tensor_debug_summary(
+                "kv_cache_kernel_block_id_device",
+                attn_inputs.kv_cache_kernel_block_id_device,
+            ),
+        ]
+    )
 
 
 class Qwen3NextMetadata(object):
@@ -189,6 +228,14 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
         #     : attn_inputs.input_lengths.size(0) + 1
         # ]
         cu_seqlen_without_padding = attn_inputs.cu_seqlens_device
+        _core_debug(
+            "prefill conv1d begin layer=%s seq_size_per_block=%s has_kv_cache=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            seq_size_per_block,
+            kv_cache_tensor is not None,
+            tensor_debug_summary("mixed_qkv", mixed_qkv),
+            _attention_inputs_debug_summary(attn_inputs),
+        )
         conv_states = (
             self._get_conv_states(kv_cache_tensor).transpose(1, 2)
             if kv_cache_tensor is not None
@@ -205,6 +252,11 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
             prefix_lengths=attn_inputs.prefix_lengths_device,
             metadata=metadata,
         ).transpose(0, 1)
+        _core_debug(
+            "prefill conv1d end layer=%s %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("conv1d_out", out),
+        )
         return out
 
     def _fla(
@@ -216,7 +268,22 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
         seq_size_per_block: int,
         attn_inputs: PyAttentionInputs,
     ) -> torch.Tensor:
+        _core_debug(
+            "prefill fla begin layer=%s seq_size_per_block=%s %s; %s; %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            seq_size_per_block,
+            tensor_debug_summary("mixed_qkv", mixed_qkv),
+            tensor_debug_summary("b", b),
+            tensor_debug_summary("a", a),
+            _attention_inputs_debug_summary(attn_inputs),
+        )
         g, beta = fused_gdn_gating(self.alog, a, b, self.dt_bias)
+        _core_debug(
+            "prefill fla after fused_gdn_gating layer=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("g", g),
+            tensor_debug_summary("beta", beta),
+        )
         ssm_states = (
             self._get_ssm_states(kv_cache_tensor)
             if kv_cache_tensor is not None
@@ -236,6 +303,18 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
                 dtype=self.ssm_state_dtype,
             )
 
+            _core_debug(
+                "prefill fla load_initial_state begin layer=%s %s; %s; %s",
+                getattr(self, "debug_layer_idx", -1),
+                tensor_debug_summary(
+                    "prefix_lengths_device", attn_inputs.prefix_lengths_device
+                ),
+                tensor_debug_summary(
+                    "kv_cache_kernel_block_id_device",
+                    attn_inputs.kv_cache_kernel_block_id_device,
+                ),
+                tensor_debug_summary("ssm_states", ssm_states),
+            )
             load_initial_state_from_block_map(
                 attn_inputs.prefix_lengths_device,
                 attn_inputs.kv_cache_kernel_block_id_device,
@@ -243,10 +322,20 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
                 initial_states,
                 seq_size_per_block,
             )
+            _core_debug(
+                "prefill fla load_initial_state end layer=%s %s",
+                getattr(self, "debug_layer_idx", -1),
+                tensor_debug_summary("initial_states", initial_states),
+            )
         # M >= 2048: scatter_qkv (Triton, SGLang port) avoids the .view() ->
         # .contiguous() copies that torch.split + view triggers. Below 2048,
         # kernel launch overhead beats the savings (microbench measured).
         if mixed_qkv.shape[0] >= 2048 and self.head_k_dim == self.head_v_dim:
+            _core_debug(
+                "prefill fla scatter_qkv begin layer=%s token_num=%s",
+                getattr(self, "debug_layer_idx", -1),
+                mixed_qkv.shape[0],
+            )
             query, key, value = scatter_qkv(
                 mixed_qkv,
                 self.local_num_k_heads,
@@ -255,6 +344,11 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
                 self.head_v_dim,
             )
         else:
+            _core_debug(
+                "prefill fla split_qkv begin layer=%s token_num=%s",
+                getattr(self, "debug_layer_idx", -1),
+                mixed_qkv.shape[0],
+            )
             query, key, value = torch.split(
                 mixed_qkv,
                 [
@@ -271,9 +365,26 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
             value = value.view(
                 1, value.shape[0], self.local_num_v_heads, self.head_v_dim
             )
+        _core_debug(
+            "prefill fla qkv ready layer=%s %s; %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("query", query),
+            tensor_debug_summary("key", key),
+            tensor_debug_summary("value", value),
+        )
         use_flydsl_chunk_gdn = (
             is_flydsl_chunk_gdn_enabled()
             and is_flydsl_chunk_gdn_shape_supported(query, key, value, beta)
+        )
+        _core_debug(
+            "prefill fla dispatch layer=%s use_flydsl=%s has_ssm_states=%s has_initial_states=%s %s",
+            getattr(self, "debug_layer_idx", -1),
+            use_flydsl_chunk_gdn,
+            ssm_states is not None,
+            initial_states is not None,
+            tensor_debug_summary(
+                "cu_seqlens_without_padding", cu_seqlens_without_padding
+            ),
         )
         if use_flydsl_chunk_gdn:
             # When ssm_states is provided the megakernel writes cache blocks
@@ -316,7 +427,28 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
                 cu_seqlens=cu_seqlens_without_padding,
                 use_qk_l2norm_in_kernel=True,
             )
+        _core_debug(
+            "prefill fla after chunk_gdn layer=%s use_flydsl=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            use_flydsl_chunk_gdn,
+            tensor_debug_summary("attn_out", attn_out),
+            tensor_debug_summary("final_state", final_state),
+        )
         if ssm_states is not None and not use_flydsl_chunk_gdn:
+            _core_debug(
+                "prefill fla store_ssm_state begin layer=%s %s; %s; %s",
+                getattr(self, "debug_layer_idx", -1),
+                tensor_debug_summary(
+                    "prefix_lengths_device", attn_inputs.prefix_lengths_device
+                ),
+                tensor_debug_summary(
+                    "cu_seqlens_without_padding", cu_seqlens_without_padding
+                ),
+                tensor_debug_summary(
+                    "kv_cache_kernel_block_id_device",
+                    attn_inputs.kv_cache_kernel_block_id_device,
+                ),
+            )
             store_ssm_state_to_block_map(
                 h,
                 final_state,
@@ -327,6 +459,15 @@ class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
                 seq_size_per_block,
                 chunk_size=64,
             )
+            _core_debug(
+                "prefill fla store_ssm_state end layer=%s",
+                getattr(self, "debug_layer_idx", -1),
+            )
+        _core_debug(
+            "prefill fla end layer=%s %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("attn_out_squeezed", attn_out.squeeze(0)),
+        )
         return attn_out.squeeze_(0)
 
     def forward(
@@ -387,6 +528,14 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
         attn_inputs: PyAttentionInputs,
         is_target_verify: bool,
     ) -> torch.Tensor:
+        _core_debug(
+            "decode conv1d begin layer=%s is_target_verify=%s seq_size_per_block=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            is_target_verify,
+            seq_size_per_block,
+            tensor_debug_summary("mixed_qkv", mixed_qkv),
+            _attention_inputs_debug_summary(attn_inputs),
+        )
         conv_states = self._get_conv_states(kv_cache_tensor)
         # (batch, dim) -> # (batch, dim, 1)
         batch, seq = self._get_bs_from_attenion_input(
@@ -406,6 +555,11 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
             sequence_lengths=attn_inputs.sequence_lengths_plus_1_device,
         )
         out = out.transpose(1, 2).reshape(origin_shape)
+        _core_debug(
+            "decode conv1d end layer=%s %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("out", out),
+        )
         return out
 
     def _fla(
@@ -418,6 +572,16 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
         attn_inputs: PyAttentionInputs,
         is_target_verify: bool,
     ) -> torch.Tensor:
+        _core_debug(
+            "decode fla begin layer=%s is_target_verify=%s seq_size_per_block=%s %s; %s; %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            is_target_verify,
+            seq_size_per_block,
+            tensor_debug_summary("mixed_qkv", mixed_qkv),
+            tensor_debug_summary("b", b),
+            tensor_debug_summary("a", a),
+            _attention_inputs_debug_summary(attn_inputs),
+        )
         batch, seq = self._get_bs_from_attenion_input(
             mixed_qkv, attn_inputs, is_target_verify
         )
@@ -439,11 +603,28 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
         )
 
         g, beta = fused_gdn_gating(self.alog, a, b, self.dt_bias)
+        _core_debug(
+            "decode fla after fused_gdn_gating layer=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("g", g),
+            tensor_debug_summary("beta", beta),
+        )
 
         # contiguous will be applyed when call fused_recurrent_gated_delta_rule
         g = g.view(batch, seq, self.local_num_v_heads)
         beta = beta.view(batch, seq, self.local_num_v_heads)
         ssm_states = self._get_ssm_states(kv_cache_tensor)
+        _core_debug(
+            "decode fla recurrent begin layer=%s %s; %s; %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("query", query),
+            tensor_debug_summary("key", key),
+            tensor_debug_summary("value", value),
+            tensor_debug_summary(
+                "sequence_lengths_plus_1_device",
+                attn_inputs.sequence_lengths_plus_1_device,
+            ),
+        )
         core_attn_out, _ = fused_recurrent_gated_delta_rule(
             q=query,
             k=key,
@@ -460,6 +641,12 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
         )
         res = core_attn_out.reshape(
             [-1, core_attn_out.shape[2], core_attn_out.shape[3]]
+        )
+        _core_debug(
+            "decode fla end layer=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("core_attn_out", core_attn_out),
+            tensor_debug_summary("res", res),
         )
         return res
 
@@ -712,10 +899,29 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         """CP prefill path: all-gather projected states, compute on full sequence,
         extract local zigzag tokens."""
+        _core_debug(
+            "cp prefill begin layer=%s %s; %s; %s; %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("mixed_qkv", mixed_qkv),
+            tensor_debug_summary("z", z),
+            tensor_debug_summary("b", b),
+            tensor_debug_summary("a", a),
+            _attention_inputs_debug_summary(attention_inputs),
+        )
         cp_info = attention_inputs.context_parallel_info
 
         packed = torch.cat([mixed_qkv, b, a], dim=-1)
+        _core_debug(
+            "cp prefill all_gather begin layer=%s %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("packed", packed),
+        )
         full_packed = all_gather(packed, group=Group.TP)
+        _core_debug(
+            "cp prefill all_gather end layer=%s %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("full_packed", full_packed),
+        )
 
         padding_mask = cp_info.prefill_qkv_padding_mask
         restore_indices = cp_info.prefill_qkv_restore_indice
@@ -745,6 +951,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if kv_cache_tensor is not None
             else None
         )
+        _core_debug(
+            "cp prefill conv1d begin layer=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("full_mixed_qkv", full_mixed_qkv),
+            tensor_debug_summary("full_cu", full_cu),
+        )
         full_mixed_qkv = causal_conv1d_fn(
             x=full_mixed_qkv.transpose(0, 1),
             weight=gdn.conv_weights,
@@ -756,8 +968,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             prefix_lengths=attention_inputs.prefix_lengths_device,
             metadata=full_conv_meta,
         ).transpose(0, 1)
+        _core_debug(
+            "cp prefill conv1d end layer=%s %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("full_mixed_qkv", full_mixed_qkv),
+        )
 
         g, beta = fused_gdn_gating(gdn.alog, full_a, full_b, gdn.dt_bias)
+        _core_debug(
+            "cp prefill after fused_gdn_gating layer=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            tensor_debug_summary("g", g),
+            tensor_debug_summary("beta", beta),
+        )
         ssm_states = (
             gdn._get_ssm_states(kv_cache_tensor)
             if kv_cache_tensor is not None
@@ -808,6 +1031,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             is_flydsl_chunk_gdn_enabled()
             and is_flydsl_chunk_gdn_shape_supported(query, key, value, beta)
         )
+        _core_debug(
+            "cp prefill fla dispatch layer=%s use_flydsl=%s %s; %s; %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            use_flydsl_chunk_gdn,
+            tensor_debug_summary("query", query),
+            tensor_debug_summary("key", key),
+            tensor_debug_summary("value", value),
+            tensor_debug_summary("full_cu", full_cu),
+        )
         if use_flydsl_chunk_gdn:
             need_final_state = ssm_states is None
             attn_out, final_state = chunk_gated_delta_rule_flydsl_with_cache_store(
@@ -847,6 +1079,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 cu_seqlens=full_cu,
                 use_qk_l2norm_in_kernel=True,
             )
+
+        _core_debug(
+            "cp prefill after chunk_gdn layer=%s use_flydsl=%s %s; %s",
+            getattr(self, "debug_layer_idx", -1),
+            use_flydsl_chunk_gdn,
+            tensor_debug_summary("attn_out", attn_out),
+            tensor_debug_summary("final_state", final_state),
+        )
 
         if ssm_states is not None and not use_flydsl_chunk_gdn:
             store_ssm_state_to_block_map(
@@ -985,6 +1225,12 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hw_kernel_config=hw_kernel_config,
             )
 
+        setattr(self.self_attn, "debug_layer_idx", layer_idx)
+        if hasattr(self.self_attn, "prefill_gdn"):
+            setattr(self.self_attn.prefill_gdn, "debug_layer_idx", layer_idx)
+        if hasattr(self.self_attn, "decode_gdn"):
+            setattr(self.self_attn.decode_gdn, "debug_layer_idx", layer_idx)
+
         self.input_layernorm = RMSResNorm(
             weights[W.pre_ln_gamma], eps=config.layernorm_eps
         )
@@ -1001,7 +1247,30 @@ class Qwen3NextDecoderLayer(nn.Module):
         attention_inputs: Optional[PyAttentionInputs] = None,
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        phase = (
+            "target_verify"
+            if attn_meta.is_target_verify
+            else (
+                "prefill"
+                if attention_inputs is not None and attention_inputs.is_prefill
+                else "decode"
+            )
+        )
+        _core_debug(
+            "layer begin layer=%s type=%s phase=%s %s; %s",
+            self.layer_idx,
+            self.layer_type,
+            phase,
+            tensor_debug_summary("hidden_states", hidden_states),
+            tensor_debug_summary("residual", residual),
+        )
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        _core_debug(
+            "layer after input_layernorm layer=%s %s; %s",
+            self.layer_idx,
+            tensor_debug_summary("hidden_states", hidden_states),
+            tensor_debug_summary("residual", residual),
+        )
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -1010,10 +1279,26 @@ class Qwen3NextDecoderLayer(nn.Module):
             attention_inputs=attention_inputs,
             attn_meta=attn_meta,
         )
+        _core_debug(
+            "layer after self_attn layer=%s %s",
+            self.layer_idx,
+            tensor_debug_summary("hidden_states", hidden_states),
+        )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        _core_debug(
+            "layer after post_attention_layernorm layer=%s %s; %s",
+            self.layer_idx,
+            tensor_debug_summary("hidden_states", hidden_states),
+            tensor_debug_summary("residual", residual),
+        )
 
         hidden_states = self.mlp(hidden_states)
+        _core_debug(
+            "layer end after mlp layer=%s %s",
+            self.layer_idx,
+            tensor_debug_summary("hidden_states", hidden_states),
+        )
 
         return hidden_states, residual
 
@@ -1130,7 +1415,17 @@ class Qwen3NextModel(GptModelBase):
         return self.embed_tokens(input_ids)
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
+        _core_debug(
+            "model forward begin %s; %s; %s",
+            tensor_debug_summary("input_ids", inputs.input_ids),
+            tensor_debug_summary("combo_position_ids", inputs.combo_position_ids),
+            _attention_inputs_debug_summary(inputs.attention_inputs),
+        )
         hidden_states = self.word_embedding(inputs)
+        _core_debug(
+            "model after word_embedding %s",
+            tensor_debug_summary("hidden_states", hidden_states),
+        )
 
         attention_inputs: PyAttentionInputs = inputs.attention_inputs
         prefill_conv1d_meta = None
@@ -1165,10 +1460,17 @@ class Qwen3NextModel(GptModelBase):
                     )
             else:
                 cu_seqlen_without_padding = attention_inputs.cu_seqlens_device
+                _core_debug(
+                    "model prepare prefill conv1d metadata begin %s",
+                    tensor_debug_summary(
+                        "cu_seqlen_without_padding", cu_seqlen_without_padding
+                    ),
+                )
                 prefill_conv1d_meta = prepare_causal_conv1d_metadata(
                     query_start_loc=cu_seqlen_without_padding,
                     device=hidden_states.device,
                 )
+                _core_debug("model prepare prefill conv1d metadata end")
 
         attn_meta = Qwen3NextMetadata(
             prefill_conv1d_meta=prefill_conv1d_meta,
@@ -1188,6 +1490,14 @@ class Qwen3NextModel(GptModelBase):
 
         for i, decoder_layer in enumerate(self.layers):
             select_block_map_for_layer(attention_inputs, i)
+            _core_debug(
+                "model selected block map layer=%s %s",
+                i,
+                tensor_debug_summary(
+                    "kv_cache_kernel_block_id_device",
+                    attention_inputs.kv_cache_kernel_block_id_device,
+                ),
+            )
             hidden_states, residual = decoder_layer(
                 hidden_states,
                 residual,
@@ -1198,6 +1508,11 @@ class Qwen3NextModel(GptModelBase):
             )
 
         hidden_states, residual = self.norm(hidden_states, residual)
+        _core_debug(
+            "model forward end after final norm %s; %s",
+            tensor_debug_summary("hidden_states", hidden_states),
+            tensor_debug_summary("residual", residual),
+        )
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
 
 
