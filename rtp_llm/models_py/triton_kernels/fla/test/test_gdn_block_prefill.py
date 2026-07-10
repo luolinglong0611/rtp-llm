@@ -32,11 +32,15 @@ def _linear_offset_test_kernel(output, index, stride):
 class BlockTest(unittest.TestCase):
     def test_large_chunk_state_offset_uses_int64(self):
         output = torch.empty(1, dtype=torch.int64, device="cuda")
-        chunk_index = 8191
-        ssm_per_batch = 16 * 128 * 128
-        _linear_offset_test_kernel[(1,)](output, chunk_index + 1, ssm_per_batch)
-        self.assertEqual(output.item(), (chunk_index + 1) * ssm_per_batch)
-        self.assertEqual(output.item(), 1 << 31)
+        cases = [
+            (8192, 16 * 128 * 128),
+            (4096, 32 * 128 * 128),
+        ]
+        for chunk_index, ssm_per_chunk in cases:
+            with self.subTest(chunk_index=chunk_index, ssm_per_chunk=ssm_per_chunk):
+                _linear_offset_test_kernel[(1,)](output, chunk_index, ssm_per_chunk)
+                self.assertEqual(output.item(), chunk_index * ssm_per_chunk)
+                self.assertEqual(output.item(), 1 << 31)
 
     def test_load_initial_state_from_block_map(self):
         device = torch.device("cuda")
