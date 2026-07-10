@@ -232,18 +232,32 @@ def select_strategy(
     # selection. Strict so an unavailable fused kernel fails loudly rather
     # than silently downgrading to non-fused (which would invalidate tests).
     if cfg.ep_size > 1 and forced in (None, "mega"):
+        from rtp_llm.models_py.modules.dsv4.moe.mega_fp4_buf import (
+            mega_moe_fp4_requested,
+        )
         from rtp_llm.models_py.modules.dsv4.moe.mega_fused_buf import (
             mega_moe_fused_requested,
         )
 
+        if mega_moe_fused_requested() and mega_moe_fp4_requested():
+            raise RuntimeError(
+                "Conflicting Mega MoE variants: DSV4_USE_MEGA_MOE_FUSED=1 "
+                "and DSV4_USE_MEGA_MOE_FP4=1 are both set. Pick one."
+            )
         if mega_moe_fused_requested():
             forced, strict = "mega_fused", True
+        elif mega_moe_fp4_requested():
+            forced, strict = "mega_fp4", True
 
     if forced is not None:
         for cls in _STRATEGY_PRIORITY:
             if cls.name == forced:
                 if cls.can_handle(cfg):
-                    if cfg.ep_size > 1 and cls.name not in ("mega", "mega_fused"):
+                    if cfg.ep_size > 1 and cls.name not in (
+                        "mega",
+                        "mega_fused",
+                        "mega_fp4",
+                    ):
                         raise RuntimeError(
                             "DSV4 EP MoE requires MegaMoEStrategy. "
                             f"Requested strategy {forced!r} would bypass Mega "

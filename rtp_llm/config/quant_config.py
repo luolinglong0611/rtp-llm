@@ -150,6 +150,15 @@ class QuantizationConfig(ABC):
         bits = quant_config["bits"] if "bits" in quant_config else 0
         if quant_method == "fp8":
             bits = 8
+            extra_quant_fields = {
+                k: quant_config[k]
+                for k in (
+                    "expert_dtype",
+                    "expert_block_size",
+                    "expert_scale_fmt",
+                )
+                if k in quant_config
+            }
             if "weight_block_size" in quant_config:
                 weight_block = quant_config.get("weight_block_size")
                 assert isinstance(weight_block, list) and all(
@@ -157,6 +166,15 @@ class QuantizationConfig(ABC):
                 ), f"weight_block_size: {weight_block} must be same"
                 group_size = weight_block[0]
                 quant_method = Fp8BlockWiseQuantConfig.get_method()
+                return cls.from_config(
+                    {
+                        "bits": bits,
+                        "method": quant_method,
+                        "group_size": group_size,
+                        "is_quanted": True,
+                        **extra_quant_fields,
+                    }
+                )
         if quant_method == "compressed-tensors":
             config_groups = quant_config["config_groups"]
             weights_config = config_groups["group_0"]["weights"]
@@ -205,14 +223,17 @@ class QuantizationConfig(ABC):
             group_size = weights_config["group_size"]
             if (
                 weights_config["type"] == "float"
-                and bits == 4 and activation_bits == 4
+                and bits == 4
+                and activation_bits == 4
                 and group_size == 16
             ):
                 quant_method = ModelOptFp4Config.get_method()
                 mixed_attention = False
                 text_config = config_json.get("text_config", None)
                 if text_config is not None:
-                    full_attention_interval = text_config.get("full_attention_interval", 0)
+                    full_attention_interval = text_config.get(
+                        "full_attention_interval", 0
+                    )
                     if full_attention_interval != 0:
                         mixed_attention = True
                 return ModelOptFp4Config.from_config(
@@ -224,7 +245,6 @@ class QuantizationConfig(ABC):
                         "mixed_attention": mixed_attention,
                     }
                 )
-            
 
         return cls.from_config(
             {
@@ -347,6 +367,9 @@ class Fp8BlockWiseQuantConfig(QuantizationConfig):
         **kwargs: Any,
     ):
         super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
+        self.expert_dtype = kwargs.get("expert_dtype", "")
+        self.expert_block_size = kwargs.get("expert_block_size", 0)
+        self.expert_scale_fmt = kwargs.get("expert_scale_fmt", "")
 
     @classmethod
     def get_method(cls) -> str:
@@ -614,7 +637,7 @@ class ModelOptFp4Config(QuantizationConfig):
 
     def __init__(self, bits: int, group_size: int, is_quanted: bool, **kwargs: Any):
         super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted)
-        self.mixed_attention = kwargs.get('mixed_attention', False)
+        self.mixed_attention = kwargs.get("mixed_attention", False)
 
     @classmethod
     def get_method(cls) -> str:
@@ -683,9 +706,7 @@ DEFAULT_MODELOPT_FP4_QUANT_CONFIG = ModelOptFp4Config(
 )
 
 DEFAULT_W4A8_INT4_PER_CHANNEL_QUANT_CONFIG = W4a8Int4PerChannelQuantConfig(
-    bits=4,
-    group_size=128,
-    is_quanted=False
+    bits=4, group_size=128, is_quanted=False
 )
 
 preset_quant_config = {

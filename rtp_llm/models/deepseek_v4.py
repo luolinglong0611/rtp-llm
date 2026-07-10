@@ -318,6 +318,16 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
             expert_num=self.expert_num_,
             align_size=self._moe_align_size,
         )
+        quant_config = getattr(self, "_quant_config", None)
+        expert_dtype = str(getattr(quant_config, "expert_dtype", "") or "").lower()
+        expert_scale_fmt = str(
+            getattr(quant_config, "expert_scale_fmt", "") or ""
+        ).lower()
+        routed_scale_dtype = (
+            torch.int32
+            if expert_dtype == "nvfp4" or expert_scale_fmt == "ue4m3_packed"
+            else torch.float8_e8m0fnu
+        )
         # V4 routed experts ship as I8-packed FP4 (e2m1) + UE8M0 group-32
         # scale, both consumed natively by DeepGEMM's fp8_fp4_gemm_nt.  The
         # framework's quant_config (Fp8BlockWiseQuantConfig from ckpt's
@@ -327,7 +337,10 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         # (int8 packed FP4) AND the .scale (UE8M0) as separate MoeAtomicWeight
         # entries so the framework loader treats them as two ordinary stacked
         # MoE tensors per expert.  No postprocess transform is needed — the
-        # ckpt layout is already DeepGEMM-consumable.  Note: data_type must
+        # ckpt layout is already DeepGEMM-consumable for the default MXFP4 path.
+        # NVFP4 checkpoints advertise expert_dtype=nvfp4 and store packed UE4M3
+        # int32 scales; those are consumed by the fp4_fp4_mega_moe opt-in path
+        # after a DeepGEMM layout transform in MegaMoEFP4Strategy.  Note: data_type must
         # match the safetensors I8 dtype (torch.int8); torch.uint8 also has
         # 1 byte/element and the bytes are bit-identical, but downstream
         # consumers (QuantizedLinear factory + DeepGEMM kPackedFP4 path)
@@ -364,7 +377,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     ],
                     stack_,
                     config=moe_cfg,
-                    data_type=torch.float8_e8m0fnu,
+                    data_type=routed_scale_dtype,
                 )
             )
         return out
