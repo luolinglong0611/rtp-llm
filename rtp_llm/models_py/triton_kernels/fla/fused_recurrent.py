@@ -43,6 +43,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     block_map,
     sequence_lengths,
     block_map_stride_b: tl.int64,
+    max_block_size: tl.int32,
     scale,
     N,  # num of sequences
     T,  # num of tokens
@@ -232,9 +233,11 @@ def fused_recurrent_gated_delta_rule_fwd(
     ), "stride_qd, stride_kd, stride_vd must be 1"
 
     block_map_stride_b = 0
+    max_block_size = 0
     if block_map is not None:
         assert block_map.ndim == 2, "block_map must be a 2D tensor"
         block_map_stride_b = block_map.stride(0)
+        max_block_size = block_map.shape[1]
 
     grid = (NK, NV, N * HV)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
@@ -250,6 +253,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         block_map=block_map,
         sequence_lengths=sequence_lengths,
         block_map_stride_b=block_map_stride_b,
+        max_block_size=max_block_size,
         scale=scale,
         N=N,
         T=T,
