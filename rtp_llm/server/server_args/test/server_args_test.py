@@ -38,6 +38,7 @@ class ServerArgsSetTest(TestCase):
         os.environ["DASH_SC_GRPC_PRE_STOP_DRAIN_SECONDS"] = "9"
         os.environ["LOADER_RECYCLE_HANDLES"] = "false"
         os.environ["MOE_PURE_TP_PRESHARD"] = "true"
+        os.environ["MAX_RPC_TIMEOUT_MS"] = "7200000"
 
         sys.argv = ["prog"]
 
@@ -76,6 +77,11 @@ class ServerArgsSetTest(TestCase):
         )
         self.assertEqual(
             py_env_configs.server_config.dash_sc_grpc_pre_stop_drain_seconds, 9.0
+        )
+
+        # Verify pd_separation_config
+        self.assertEqual(
+            py_env_configs.pd_separation_config.max_rpc_timeout_ms, 7200000
         )
 
         # Verify runtime_config (warm_up is now in RuntimeConfig)
