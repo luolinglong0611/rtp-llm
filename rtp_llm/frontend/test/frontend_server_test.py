@@ -57,6 +57,11 @@ class FakeRawRequest(object):
         return False
 
 
+async def failing_stream():
+    yield FakePipelinResponse(res="partial")
+    raise RuntimeError("backend stream failed")
+
+
 class FrontendServerTest(TestCase):
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -109,6 +114,49 @@ class FrontendServerTest(TestCase):
         asyncio.run(self.frontend_server.close())
 
         self.assertTrue(self.frontend_server._frontend_worker.close_called)
+
+    def test_openai_stream_error_has_error_envelope_and_done_event(self):
+        async def collect_chunks():
+            response = CompleteResponseAsyncGenerator(
+                failing_stream(), CompleteResponseAsyncGenerator.get_last_value
+            )
+            self.frontend_server._global_controller.increment()
+            return [
+                chunk
+                async for chunk in self.frontend_server.stream_response(
+                    {"stream": True, "source": "test", "__request_id__": 1},
+                    response,
+                )
+            ]
+
+        chunks = asyncio.run(collect_chunks())
+
+        self.assertEqual(chunks[0], 'data: {"res":"partial"}\r\n\r\n')
+        error_payload = json.loads(chunks[1].removeprefix("data: "))
+        self.assertIn("error", error_payload)
+        self.assertIn("backend stream failed", error_payload["error"]["message"])
+        self.assertEqual(chunks[2], "data: [DONE]\r\n\r\n")
+
+    def test_internal_stream_error_keeps_legacy_envelope_and_done_event(self):
+        async def collect_chunks():
+            response = CompleteResponseAsyncGenerator(
+                failing_stream(), CompleteResponseAsyncGenerator.get_last_value
+            )
+            self.frontend_server._global_controller.increment()
+            return [
+                chunk
+                async for chunk in self.frontend_server.stream_response(
+                    {"stream": False, "source": "test", "__request_id__": 2},
+                    response,
+                )
+            ]
+
+        chunks = asyncio.run(collect_chunks())
+
+        error_payload = json.loads(chunks[1].removeprefix("data:"))
+        self.assertNotIn("error", error_payload)
+        self.assertIn("backend stream failed", error_payload["message"])
+        self.assertEqual(chunks[2], "data:[done]\r\n\r\n")
 
 
 main()

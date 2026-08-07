@@ -233,9 +233,14 @@ class FrontendServer(object):
                     "error_code": str(format_e.get("error_code_str", -1)),
                 },
             )
+            error_response = {"error": format_e} if is_openai_response else format_e
             yield response_data_prefix + json.dumps(
-                format_e, ensure_ascii=False
+                error_response, ensure_ascii=False
             ) + "\r\n\r\n"
+            if is_openai_response:
+                yield "data: [DONE]\r\n\r\n"
+            else:
+                yield "data:[done]\r\n\r\n"
         finally:
             self._global_controller.decrement()
 
