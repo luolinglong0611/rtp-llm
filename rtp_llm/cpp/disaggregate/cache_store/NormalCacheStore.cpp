@@ -63,6 +63,8 @@ bool NormalCacheStore::init(const CacheStoreInitParams& params) {
     messager_init_params.rdma_worker_thread_count     = params.rdma_worker_thread_count;
     messager_init_params.io_thread_count              = params.messager_io_thread_count;
     messager_init_params.worker_thread_count          = params.messager_worker_thread_count;
+    messager_init_params.anet_rpc_thread_num          = params.tcp_anet_rpc_thread_num;
+    messager_init_params.anet_rpc_queue_num           = params.tcp_anet_rpc_queue_num;
     messager_init_params.device_id                    = params.device_id;
 
     if (!messager_->init(messager_init_params)) {

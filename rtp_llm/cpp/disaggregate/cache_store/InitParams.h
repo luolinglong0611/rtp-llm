@@ -10,6 +10,8 @@ struct MessagerInitParams {
     uint32_t server_port         = 0;
     uint32_t io_thread_count     = 2;
     uint32_t worker_thread_count = 4;
+    uint32_t anet_rpc_thread_num = 3;
+    uint32_t anet_rpc_queue_num  = 1024;
     int      device_id           = -1;
 
     uint32_t rdma_server_port         = 0;
@@ -42,6 +44,8 @@ public:
 
     uint32_t messager_io_thread_count     = 4;
     uint32_t messager_worker_thread_count = 32;
+    uint32_t tcp_anet_rpc_thread_num      = 3;
+    uint32_t tcp_anet_rpc_queue_num       = 1024;
 
     kmonitor::MetricsReporterPtr metrics_reporter;
     int                          device_id{-1};

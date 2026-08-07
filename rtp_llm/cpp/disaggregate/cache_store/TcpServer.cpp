@@ -11,7 +11,11 @@ TcpServer::~TcpServer() {
     stop();
 }
 
-bool TcpServer::init(uint32_t io_thread_count, uint32_t worker_thread_count, bool enable_metric) {
+bool TcpServer::init(uint32_t io_thread_count,
+                     uint32_t worker_thread_count,
+                     bool     enable_metric,
+                     uint32_t anet_rpc_thread_num,
+                     uint32_t anet_rpc_queue_num) {
     if (rpc_server_transport_ == nullptr) {
         rpc_server_transport_.reset(new anet::Transport(io_thread_count));
         if (!rpc_server_transport_ || !rpc_server_transport_->start()) {
@@ -20,7 +24,7 @@ bool TcpServer::init(uint32_t io_thread_count, uint32_t worker_thread_count, boo
         rpc_server_transport_->setName("TcpServer");
     }
 
-    rpc_server_.reset(new arpc::ANetRPCServer(rpc_server_transport_.get(), 3, 100));
+    rpc_server_.reset(new arpc::ANetRPCServer(rpc_server_transport_.get(), anet_rpc_thread_num, anet_rpc_queue_num));
     if (enable_metric) {
         arpc::KMonitorANetMetricReporterConfig metricConfig;
         metricConfig.metricLevel                 = kmonitor::FATAL;
@@ -35,14 +39,19 @@ bool TcpServer::init(uint32_t io_thread_count, uint32_t worker_thread_count, boo
     }
 
     rpc_worker_threadpool_.reset(
-        new autil::LockFreeThreadPool(worker_thread_count, 100, nullptr, "tcp_server_rpc_threadpool", false));
+        new autil::LockFreeThreadPool(
+            worker_thread_count, anet_rpc_queue_num, nullptr, "tcp_server_rpc_threadpool", false));
     if (!rpc_worker_threadpool_->start()) {
         RTP_LLM_LOG_WARNING("tcp server init failed, start rpc worker threadpool failed");
         return false;
     }
 
-    RTP_LLM_LOG_INFO(
-        "tcp server init success, io thread count %d, worker thread count %d", io_thread_count, worker_thread_count);
+    RTP_LLM_LOG_INFO("tcp server init success, io thread count %d, worker thread count %d, "
+                     "anet rpc thread count %d, rpc queue size %d",
+                     io_thread_count,
+                     worker_thread_count,
+                     anet_rpc_thread_num,
+                     anet_rpc_queue_num);
     return true;
 }
 

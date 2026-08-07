@@ -11,7 +11,11 @@ public:
     ~TcpServer();
 
 public:
-    bool init(uint32_t io_thread_count, uint32_t worker_thread_count, bool enable_metric);
+    bool init(uint32_t io_thread_count,
+              uint32_t worker_thread_count,
+              bool     enable_metric,
+              uint32_t anet_rpc_thread_num = 3,
+              uint32_t anet_rpc_queue_num  = 1024);
     bool registerService(RPCService* rpc_service);
     bool start(uint32_t listen_port);
 

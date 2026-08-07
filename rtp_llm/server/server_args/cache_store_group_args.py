@@ -175,6 +175,6 @@ def init_cache_store_group_args(parser, cache_store_config):
         env_name="CACHE_STORE_TCP_ANET_RPC_QUEUE_NUM",
         bind_to=(cache_store_config, "cache_store_tcp_anet_rpc_queue_num"),
         type=int,
-        default=100,
-        help="P2P TCP 控制面 ANetRPCServer queueNum。",
+        default=1024,
+        help="P2P TCP 控制面 ANetRPCServer 及服务 worker queueNum。",
     )
