@@ -29,3 +29,14 @@ py_test(
     },
     tags = ["frontend"],
 )
+
+py_test(
+    name = "qwen35_model_config_test",
+    srcs = [
+        "qwen35_model_config_test.py",
+    ],
+    deps = [
+        "//rtp_llm:rtp_llm_frontend_lib",
+    ],
+    tags = ["frontend"],
+)

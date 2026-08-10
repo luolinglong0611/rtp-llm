@@ -1,14 +1,23 @@
 import logging
-from typing import Optional, Type
+from typing import TYPE_CHECKING, Optional, Type
 
-from rtp_llm.device.device_base import DeviceBase
-from rtp_llm.device.device_impl import ArmCpuImpl, CpuImpl, CudaImpl, PpuImpl, RocmImpl
 from rtp_llm.device.device_type import DeviceType, get_device_type
 
-_current_device: Optional[DeviceBase] = None
+if TYPE_CHECKING:
+    from rtp_llm.device.device_base import DeviceBase
+
+_current_device: Optional["DeviceBase"] = None
 
 
 def get_device_cls(type: DeviceType) -> Type:
+    from rtp_llm.device.device_impl import (
+        ArmCpuImpl,
+        CpuImpl,
+        CudaImpl,
+        PpuImpl,
+        RocmImpl,
+    )
+
     if type == DeviceType.Cpu:
         return CpuImpl
     elif type == DeviceType.ArmCpu:
@@ -23,7 +32,7 @@ def get_device_cls(type: DeviceType) -> Type:
         raise ValueError(f"Invalid device type {type}")
 
 
-def get_current_device() -> DeviceBase:
+def get_current_device() -> "DeviceBase":
     global _current_device
 
     if _current_device != None:

@@ -9,6 +9,7 @@ import torch
 CUR_PATH = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(str(CUR_PATH), ".."))
 
+import rtp_llm.config.qwen3_next_config  # noqa: F401
 from rtp_llm.config.engine_config import EngineConfig, finalize_scheduler_config
 from rtp_llm.config.kv_cache_config import KVCacheConfig
 from rtp_llm.config.model_args import ModelArgs
@@ -22,7 +23,11 @@ from rtp_llm.config.py_config_modules import (
     RenderConfig,
     VitConfig,
 )
-from rtp_llm.model_factory_register import _model_factory, ensure_model_registered
+from rtp_llm.model_factory_register import (
+    _model_config_factory,
+    _model_factory,
+    ensure_model_registered,
+)
 from rtp_llm.ops import (
     ProfilingDebugLoggingConfig,
     SpeculativeType,
@@ -60,6 +65,18 @@ class ModelFactory:
             raise KeyError(f"model type [{model_type}] is not registered")
         model_cls = _model_factory[model_type]
         return model_cls
+
+    @staticmethod
+    def get_model_config_cls(model_type: str):
+        model_cls = _model_factory.get(model_type)
+        if model_cls is not None:
+            return model_cls
+        config_cls = _model_config_factory.get(model_type)
+        if config_cls is not None:
+            return config_cls
+        if ensure_model_registered(model_type):
+            return _model_factory[model_type]
+        raise KeyError(f"model type [{model_type}] is not registered")
 
     @staticmethod
     def _create_model(
@@ -292,8 +309,8 @@ class ModelFactory:
         Returns:
             ModelConfig instance for the main model
         """
-        model_cls = ModelFactory.get_model_cls(model_args.model_type)
-        model_config = model_cls._create_config(model_args.ckpt_path)
+        model_config_cls = ModelFactory.get_model_config_cls(model_args.model_type)
+        model_config = model_config_cls._create_config(model_args.ckpt_path)
         build_model_config(
             model_config=model_config,
             model_args=model_args,
@@ -303,7 +320,7 @@ class ModelFactory:
             quantization_config=quantization_config,
             vit_config=vit_config,
         )
-        model_cls._post_build_model_config(model_config)
+        model_config_cls._post_build_model_config(model_config)
 
         # Set model metadata fields
         # Set lora_infos from lora_config (direct assignment)
@@ -312,7 +329,9 @@ class ModelFactory:
             model_config.lora_infos = lora_infos if lora_infos else {}
 
         # Set model_name (default to model class name)
-        model_config.model_name = model_cls.__name__
+        model_config.model_name = getattr(
+            model_config_cls, "model_name", model_config_cls.__name__
+        )
 
         # Set renderer configuration fields
         model_config.generate_env_config = (

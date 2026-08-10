@@ -13,6 +13,7 @@ CUR_PATH = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(str(CUR_PATH), ".."))
 
 _model_factory: Dict[str, Type[Any]] = {}
+_model_config_factory: Dict[str, Type[Any]] = {}
 _model_registry_lock = threading.RLock()
 _lazy_model_registry = LazyModuleRegistry("model")
 _model_type_to_module = _lazy_model_registry.name_to_module
@@ -35,6 +36,28 @@ def register_model(
                 f"try register model {name} with type {_model_factory[name]} and {model_type}, confict!"
             )
         _model_factory[name] = model_type
+
+    for architecture in support_architectures or []:
+        register_hf_architecture(architecture, name)
+
+    for repo in support_hf_repos or []:
+        register_hf_repo(repo, name)
+
+
+def register_model_config(
+    name: str,
+    config_type: Any,
+    support_architectures: Optional[List[str]] = None,
+    support_hf_repos: Optional[List[str]] = None,
+):
+    global _model_config_factory
+    with _model_registry_lock:
+        if name in _model_config_factory and _model_config_factory[name] != config_type:
+            raise Exception(
+                f"try register model config {name} with type "
+                f"{_model_config_factory[name]} and {config_type}, confict!"
+            )
+        _model_config_factory[name] = config_type
 
     for architecture in support_architectures or []:
         register_hf_architecture(architecture, name)
