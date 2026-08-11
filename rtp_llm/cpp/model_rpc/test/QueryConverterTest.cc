@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include <array>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -175,11 +176,27 @@ TEST_F(QueryConverterTest, TransTensorPB_BF16) {
     EXPECT_EQ(std::memcmp(proto_data.data(), tensor_data, expected_size), 0);
 }
 
+TEST_F(QueryConverterTest, TransTensorPB_UINT8RoundTrip) {
+    torch::Tensor tensor = torch::arange(18, torch::TensorOptions().dtype(torch::kUInt8)).reshape({2, 3, 3});
+    TensorPB      tensor_pb;
+
+    QueryConverter::transTensorPB(&tensor_pb, tensor);
+    torch::Tensor restored = QueryConverter::transTensor(tensor_pb);
+
+    EXPECT_EQ(tensor_pb.data_type(), TensorPB::UINT8);
+    EXPECT_EQ(tensor_pb.uint8_data().size(), 18);
+    EXPECT_EQ(restored.scalar_type(), torch::kUInt8);
+    EXPECT_TRUE(torch::equal(restored, tensor));
+}
+
 TEST_F(QueryConverterTest, TransTensorPB_ScalarShape) {
     torch::Tensor tensor = torch::tensor(42, torch::kInt32);
     TensorPB      tensor_pb;
     QueryConverter::transTensorPB(&tensor_pb, tensor);
     EXPECT_EQ(tensor_pb.shape_size(), 0);
+    torch::Tensor restored = QueryConverter::transTensor(tensor_pb);
+    EXPECT_EQ(restored.dim(), 0);
+    EXPECT_EQ(restored.item<int32_t>(), 42);
 }
 
 TEST_F(QueryConverterTest, TransTensorPB_NonContiguous) {
@@ -277,6 +294,140 @@ TEST_F(QueryConverterTest, GrammarWithMultipleSequencesIsRejectedByFactory) {
         EXPECT_NE(result.status().ToString().find("does not support beam search or num_return_sequences > 1"),
                   std::string::npos);
     }
+}
+
+TEST_F(QueryConverterTest, TransTensorPB_RejectsInvalidShapeAndPayload) {
+    TensorPB negative;
+    negative.set_data_type(TensorPB::UINT8);
+    negative.add_shape(-1);
+    negative.set_uint8_data("x");
+    EXPECT_THROW(QueryConverter::transTensor(negative), std::runtime_error);
+
+    TensorPB overflow;
+    overflow.set_data_type(TensorPB::UINT8);
+    overflow.add_shape(std::numeric_limits<int64_t>::max());
+    overflow.add_shape(2);
+    EXPECT_THROW(QueryConverter::transTensor(overflow), std::runtime_error);
+
+    TensorPB short_payload;
+    short_payload.set_data_type(TensorPB::UINT8);
+    short_payload.add_shape(2);
+    short_payload.set_uint8_data("x");
+    EXPECT_THROW(QueryConverter::transTensor(short_payload), std::runtime_error);
+
+    TensorPB long_payload;
+    long_payload.set_data_type(TensorPB::UINT8);
+    long_payload.add_shape(2);
+    long_payload.set_uint8_data("xyz");
+    EXPECT_THROW(QueryConverter::transTensor(long_payload), std::runtime_error);
+
+    TensorPB mixed_payload;
+    mixed_payload.set_data_type(TensorPB::UINT8);
+    mixed_payload.add_shape(1);
+    mixed_payload.set_uint8_data("x");
+    mixed_payload.set_fp32_data("xxxx");
+    EXPECT_THROW(QueryConverter::transTensor(mixed_payload), std::runtime_error);
+}
+
+TEST_F(QueryConverterTest, TransQueryDeserializesTensorAndKeepsLegacyUrl) {
+    GenerateInputPB tensor_input;
+    auto*           tensor_mm = tensor_input.add_multimodal_inputs();
+    tensor_mm->set_multimodal_type(1);
+    auto* tensor_pb = tensor_mm->mutable_multimodal_tensor();
+    tensor_pb->set_data_type(TensorPB::UINT8);
+    tensor_pb->add_shape(2);
+    tensor_pb->add_shape(2);
+    tensor_pb->add_shape(3);
+    tensor_pb->set_uint8_data(std::string(12, '\x07'));
+
+    auto converted_tensor_input = QueryConverter::transQuery(&tensor_input);
+    ASSERT_EQ(converted_tensor_input->multimodal_inputs.size(), 1);
+    const auto& tensor = converted_tensor_input->multimodal_inputs[0].tensor;
+    EXPECT_EQ(tensor.sizes().vec(), std::vector<int64_t>({2, 2, 3}));
+    EXPECT_EQ(tensor.scalar_type(), torch::kUInt8);
+    EXPECT_EQ(tensor[0][0][0].item<uint8_t>(), 7);
+
+    GenerateInputPB url_input;
+    auto*           url_mm = url_input.add_multimodal_inputs();
+    url_mm->set_multimodal_url("memory://legacy-image");
+    url_mm->set_multimodal_type(1);
+    url_mm->mutable_multimodal_tensor();  // legacy clients may send an explicit empty message
+
+    auto converted_url_input = QueryConverter::transQuery(&url_input);
+    ASSERT_EQ(converted_url_input->multimodal_inputs.size(), 1);
+    EXPECT_EQ(converted_url_input->multimodal_inputs[0].url, "memory://legacy-image");
+    EXPECT_EQ(converted_url_input->multimodal_inputs[0].tensor.numel(), 0);
+
+    GenerateInputPB placeholder_input;
+    auto*           placeholder_mm = placeholder_input.add_multimodal_inputs();
+    placeholder_mm->set_multimodal_url("memory://legacy-placeholder");
+    auto* placeholder_tensor = placeholder_mm->mutable_multimodal_tensor();
+    placeholder_tensor->set_data_type(TensorPB::FP32);
+    placeholder_tensor->add_shape(1);
+    placeholder_tensor->set_fp32_data(std::string(sizeof(float), '\0'));
+
+    auto converted_placeholder = QueryConverter::transQuery(&placeholder_input);
+    ASSERT_EQ(converted_placeholder->multimodal_inputs.size(), 1);
+    EXPECT_EQ(converted_placeholder->multimodal_inputs[0].url, "memory://legacy-placeholder");
+    EXPECT_EQ(converted_placeholder->multimodal_inputs[0].tensor.numel(), 0);
+
+    GenerateInputPB ambiguous_input;
+    auto*           ambiguous_mm = ambiguous_input.add_multimodal_inputs();
+    ambiguous_mm->set_multimodal_url("memory://ambiguous");
+    auto* ambiguous_tensor = ambiguous_mm->mutable_multimodal_tensor();
+    ambiguous_tensor->set_data_type(TensorPB::UINT8);
+    ambiguous_tensor->add_shape(1);
+    ambiguous_tensor->set_uint8_data("x");
+    EXPECT_THROW(QueryConverter::transQuery(&ambiguous_input), std::runtime_error);
+}
+
+TEST_F(QueryConverterTest, TransMMInputDeserializesUINT8Tensor) {
+    MultimodalInputsPB inputs_pb;
+    auto*              mm_input = inputs_pb.add_multimodal_inputs();
+    mm_input->set_multimodal_type(1);
+    auto* tensor_pb = mm_input->mutable_multimodal_tensor();
+    tensor_pb->set_data_type(TensorPB::UINT8);
+    tensor_pb->add_shape(1);
+    tensor_pb->add_shape(2);
+    tensor_pb->add_shape(3);
+    tensor_pb->set_uint8_data(std::string(6, '\x05'));
+
+    auto converted = QueryConverter::transMMInput(&inputs_pb);
+
+    ASSERT_EQ(converted.size(), 1);
+    EXPECT_EQ(converted[0].tensor.scalar_type(), torch::kUInt8);
+    EXPECT_EQ(converted[0].tensor.sizes().vec(), std::vector<int64_t>({1, 2, 3}));
+    EXPECT_EQ(converted[0].tensor[0][1][2].item<uint8_t>(), 5);
+}
+
+TEST_F(QueryConverterTest, TransMMInputsPBEnforcesOneSource) {
+    MultimodalInput legacy_url("memory://legacy-image", torch::empty({0}), 1);
+    auto            url_pb = QueryConverter::transMMInputsPB({legacy_url});
+    ASSERT_EQ(url_pb.multimodal_inputs_size(), 1);
+    EXPECT_EQ(url_pb.multimodal_inputs(0).multimodal_url(), "memory://legacy-image");
+    EXPECT_FALSE(url_pb.multimodal_inputs(0).has_multimodal_tensor());
+
+    MultimodalInput legacy_placeholder("memory://legacy-placeholder", torch::empty({1}), 1);
+    auto            legacy_placeholder_pb = QueryConverter::transMMInputsPB({legacy_placeholder});
+    ASSERT_EQ(legacy_placeholder_pb.multimodal_inputs_size(), 1);
+    EXPECT_EQ(legacy_placeholder_pb.multimodal_inputs(0).multimodal_url(), "memory://legacy-placeholder");
+    EXPECT_FALSE(legacy_placeholder_pb.multimodal_inputs(0).has_multimodal_tensor());
+
+    auto            image_tensor = torch::zeros({32, 32, 3}, torch::kUInt8);
+    MultimodalInput tensor_input("", image_tensor, 1);
+    auto            tensor_pb = QueryConverter::transMMInputsPB({tensor_input});
+    ASSERT_EQ(tensor_pb.multimodal_inputs_size(), 1);
+    EXPECT_TRUE(tensor_pb.multimodal_inputs(0).has_multimodal_tensor());
+    EXPECT_EQ(tensor_pb.multimodal_inputs(0).multimodal_tensor().data_type(), TensorPB::UINT8);
+
+    MultimodalInput ambiguous("memory://image", image_tensor, 1);
+    EXPECT_THROW(QueryConverter::transMMInputsPB({ambiguous}), std::runtime_error);
+}
+
+TEST_F(QueryConverterTest, RemoteMultimodalInvalidArgumentIsWrongFormat) {
+    EXPECT_EQ(RemoteMultimodalProcessor::grpcStatusErrorCode(grpc::StatusCode::INVALID_ARGUMENT),
+              ErrorCode::MM_WRONG_FORMAT_ERROR);
+    EXPECT_EQ(RemoteMultimodalProcessor::grpcStatusErrorCode(grpc::StatusCode::INTERNAL), ErrorCode::MM_PROCESS_ERROR);
 }
 
 }  // namespace rtp_llm

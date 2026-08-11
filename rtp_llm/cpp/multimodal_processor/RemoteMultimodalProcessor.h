@@ -31,6 +31,11 @@ private:
     MultimodalRpcPool pool_;
     std::string       vit_cluster_name_;
 
+    static ErrorCode grpcStatusErrorCode(grpc::StatusCode status_code) {
+        return status_code == grpc::StatusCode::INVALID_ARGUMENT ? ErrorCode::MM_WRONG_FORMAT_ERROR :
+                                                                   ErrorCode::MM_PROCESS_ERROR;
+    }
+
     void reportRpcClientError(const std::string& ip_port,
                               const std::string& reason,
                               const std::string& grpc_code = "") const {
@@ -93,7 +98,7 @@ private:
         reportRpcMetrics(ip_port, cost_us, request_bytes, output_pb.ByteSizeLong(), &status);
 
         if (!status.ok()) {
-            return ErrorInfo(ErrorCode::MM_PROCESS_ERROR, status.error_message());
+            return ErrorInfo(grpcStatusErrorCode(status.error_code()), status.error_message());
         }
         return QueryConverter::transMMOutput(&output_pb);
     }

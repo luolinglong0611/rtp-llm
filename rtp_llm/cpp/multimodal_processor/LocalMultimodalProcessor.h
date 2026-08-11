@@ -72,7 +72,11 @@ private:
                 }
                 return mm_embedding_res;
             } catch (py::error_already_set& e) {
-                std::string error_msg = e.what();
+                py::gil_scoped_acquire acquire;
+                std::string            error_msg = e.what();
+                if (e.matches(PyExc_ValueError) || e.matches(PyExc_TypeError)) {
+                    return ErrorInfo(ErrorCode::MM_WRONG_FORMAT_ERROR, error_msg);
+                }
                 if (error_msg.find("download failed") != std::string::npos) {
                     return ErrorInfo(ErrorCode::MM_DOWNLOAD_FAILED, error_msg);
                 }

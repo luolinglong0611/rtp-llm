@@ -96,6 +96,15 @@ requirement([
 ])
 
 py_test(
+    name = "grpc_util_test",
+    srcs = ["grpc_util_test.py"],
+    deps = [
+        "//rtp_llm:utils",
+        "//rtp_llm/cpp/model_rpc/proto:model_rpc_service_py_proto",
+    ],
+)
+
+py_test(
     name = "grpc_host_channel_pool_test",
     srcs = [
         "grpc_host_channel_pool_test.py",

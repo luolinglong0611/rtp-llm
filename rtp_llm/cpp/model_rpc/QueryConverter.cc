@@ -1,6 +1,8 @@
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
 
 #include <numeric>
+#include <stdexcept>
+#include <utility>
 
 #include "RPCPool.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -13,6 +15,58 @@ namespace rtp_llm {
     if (config_proto->has_##name()) {                                                                                  \
         generate_config->name = config_proto->name().value();                                                          \
     }
+
+namespace {
+
+bool hasNonEmptyTensor(const torch::Tensor& tensor) {
+    return tensor.defined() && tensor.numel() > 0;
+}
+
+bool isLegacyUrlTensorPlaceholder(const std::string& url, const torch::Tensor& tensor) {
+    return !url.empty() && tensor.defined() && tensor.scalar_type() == torch::kFloat32 && tensor.dim() == 1
+           && tensor.size(0) == 1;
+}
+
+bool isLegacyUrlTensorPlaceholder(const MultimodalInputPB& mm_input) {
+    if (mm_input.multimodal_url().empty() || !mm_input.has_multimodal_tensor()) {
+        return false;
+    }
+    const auto& tensor_pb = mm_input.multimodal_tensor();
+    return tensor_pb.data_type() == TensorPB::FP32 && tensor_pb.shape_size() == 1 && tensor_pb.shape(0) == 1
+           && tensor_pb.fp32_data().size() == sizeof(float) && tensor_pb.int32_data().empty()
+           && tensor_pb.fp16_data().empty() && tensor_pb.bf16_data().empty() && tensor_pb.uint8_data().empty();
+}
+
+MultimodalInput transOneMMInput(const MultimodalInputPB& mm_input) {
+    torch::Tensor tensor = torch::empty({0});
+    if (mm_input.has_multimodal_tensor() && !isLegacyUrlTensorPlaceholder(mm_input)) {
+        tensor = TensorPbConvert::pbToTorch(mm_input.multimodal_tensor());
+    }
+
+    const bool has_url    = !mm_input.multimodal_url().empty();
+    const bool has_tensor = hasNonEmptyTensor(tensor);
+    if (has_url == has_tensor) {
+        throw std::runtime_error(
+            "MultimodalInputPB must contain exactly one non-empty source: multimodal_url or multimodal_tensor.");
+    }
+
+    const auto&        config = mm_input.mm_preprocess_config();
+    std::vector<float> crop_positions(config.crop_positions().begin(), config.crop_positions().end());
+    return MultimodalInput(mm_input.multimodal_url(),
+                           std::move(tensor),
+                           mm_input.multimodal_type(),
+                           config.width(),
+                           config.height(),
+                           config.min_pixels(),
+                           config.max_pixels(),
+                           config.fps(),
+                           config.min_frames(),
+                           config.max_frames(),
+                           std::move(crop_positions),
+                           config.mm_timeout_ms());
+}
+
+}  // namespace
 
 std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const GenerateConfigPB* config_proto) {
     std::shared_ptr<GenerateConfig> generate_config = std::make_shared<GenerateConfig>();
@@ -173,25 +227,9 @@ std::shared_ptr<GenerateInput> QueryConverter::transQuery(const GenerateInputPB*
             .clone();
     if (input->multimodal_inputs_size() > 0) {
         std::vector<MultimodalInput> mm_inputs;
+        mm_inputs.reserve(input->multimodal_inputs_size());
         for (int i = 0; i < input->multimodal_inputs_size(); i++) {
-            auto               mm_input             = &input->multimodal_inputs(i);
-            auto               mm_preprocess_config = &mm_input->mm_preprocess_config();
-            std::vector<float> crop_positions;
-            for (const auto& crop_position : mm_preprocess_config->crop_positions()) {
-                crop_positions.push_back(crop_position);
-            }
-            mm_inputs.emplace_back(mm_input->multimodal_url(),
-                                   torch::empty(1),
-                                   mm_input->multimodal_type(),
-                                   mm_preprocess_config->width(),
-                                   mm_preprocess_config->height(),
-                                   mm_preprocess_config->min_pixels(),
-                                   mm_preprocess_config->max_pixels(),
-                                   mm_preprocess_config->fps(),
-                                   mm_preprocess_config->min_frames(),
-                                   mm_preprocess_config->max_frames(),
-                                   crop_positions,
-                                   mm_preprocess_config->mm_timeout_ms());
+            mm_inputs.emplace_back(transOneMMInput(input->multimodal_inputs(i)));
         }
         generate_input->multimodal_inputs = std::move(mm_inputs);
     }
@@ -231,29 +269,9 @@ std::vector<RoleAddr> QueryConverter::getRoleAddrs(const GenerateConfigPB* confi
 
 std::vector<MultimodalInput> QueryConverter::transMMInput(const MultimodalInputsPB* mm_inputs) {
     std::vector<MultimodalInput> inputs_vec;
+    inputs_vec.reserve(mm_inputs->multimodal_inputs_size());
     for (int i = 0; i < mm_inputs->multimodal_inputs_size(); i++) {
-        auto mm_input             = &mm_inputs->multimodal_inputs(i);
-        auto mm_preprocess_config = &mm_input->mm_preprocess_config();
-
-        std::vector<float> crop_positions;
-        for (const auto& crop_position : mm_preprocess_config->crop_positions()) {
-            crop_positions.push_back(crop_position);
-        }
-
-        // tensor should also converted from input pb, however it is only used in some embedding model, so just empty
-        // for now
-        inputs_vec.emplace_back(mm_input->multimodal_url(),
-                                torch::empty(1),
-                                mm_input->multimodal_type(),
-                                mm_preprocess_config->width(),
-                                mm_preprocess_config->height(),
-                                mm_preprocess_config->min_pixels(),
-                                mm_preprocess_config->max_pixels(),
-                                mm_preprocess_config->fps(),
-                                mm_preprocess_config->min_frames(),
-                                mm_preprocess_config->max_frames(),
-                                crop_positions,
-                                mm_preprocess_config->mm_timeout_ms());
+        inputs_vec.emplace_back(transOneMMInput(mm_inputs->multimodal_inputs(i)));
     }
     return inputs_vec;
 }
@@ -261,10 +279,19 @@ std::vector<MultimodalInput> QueryConverter::transMMInput(const MultimodalInputs
 MultimodalInputsPB QueryConverter::transMMInputsPB(const std::vector<MultimodalInput> mm_inputs) {
     MultimodalInputsPB mm_inputs_pb;
     for (auto& mm_input : mm_inputs) {
-        auto now_input = mm_inputs_pb.add_multimodal_inputs();
-        now_input->set_multimodal_url(mm_input.url);
+        auto       now_input                     = mm_inputs_pb.add_multimodal_inputs();
+        const bool has_url                       = !mm_input.url.empty();
+        const bool has_legacy_tensor_placeholder = isLegacyUrlTensorPlaceholder(mm_input.url, mm_input.tensor);
+        const bool has_tensor                    = hasNonEmptyTensor(mm_input.tensor) && !has_legacy_tensor_placeholder;
+        if (has_url == has_tensor) {
+            throw std::runtime_error("MultimodalInput must contain exactly one non-empty source: url or tensor.");
+        }
+        if (has_url) {
+            now_input->set_multimodal_url(mm_input.url);
+        } else {
+            transTensorPB(now_input->mutable_multimodal_tensor(), mm_input.tensor);
+        }
         now_input->set_multimodal_type(mm_input.mm_type);
-        transTensorPB(now_input->mutable_multimodal_tensor(), mm_input.tensor);
         transMMPreprocessConfig(now_input->mutable_mm_preprocess_config(), mm_input.mm_preprocess_config);
     }
     return mm_inputs_pb;

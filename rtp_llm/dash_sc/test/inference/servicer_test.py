@@ -9,12 +9,15 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import pickle
 import struct
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import torch
 
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
@@ -39,12 +42,18 @@ from rtp_llm.dash_sc.inference.servicer import (
     DashScInferenceServicer,
     _dash_error_spec_for_ft_exception,
     _derive_max_token_id,
+    _multimodal_marker_count,
     build_think_runtime,
     iter_real_model_stream_infer,
 )
 from rtp_llm.dash_sc.proto import predict_v2_pb2
 from rtp_llm.ops import RoleType
-from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput, GenerateOutputs
+from rtp_llm.utils.base_model_datatypes import (
+    AuxInfo,
+    GenerateOutput,
+    GenerateOutputs,
+    MMUrlType,
+)
 
 
 def _add_input_tensor(
@@ -63,6 +72,19 @@ def _add_input_tensor(
 
 def _unpack_int32_le(raw: bytes) -> list[int]:
     return list(struct.unpack("<%di" % (len(raw) // 4), raw))
+
+
+def _add_multimodal_image(
+    req: predict_v2_pb2.ModelInferRequest, image: np.ndarray
+) -> None:
+    payload = pickle.dumps({"image": [image]}, protocol=4)
+    _add_input_tensor(
+        req,
+        "multi_modal_data",
+        "BYTES",
+        [1],
+        struct.pack("<I", len(payload)) + payload,
+    )
 
 
 class _FakeAsyncStream:
@@ -261,6 +283,24 @@ class DeriveMaxTokenIdTest(unittest.TestCase):
 
         self.assertIsNone(_derive_max_token_id(None))
         self.assertIsNone(_derive_max_token_id(_Tokenizer()))
+
+
+class MultimodalMarkerCountTest(unittest.TestCase):
+    def test_counts_single_and_ordered_qwen_marker_pairs(self) -> None:
+        self.assertEqual(
+            _multimodal_marker_count([9, 41, 99, 42, 7, 100], [[41, 42], [100]]),
+            2,
+        )
+
+    def test_rejects_reversed_nested_or_unclosed_pairs(self) -> None:
+        for input_ids in ([42, 41], [41, 41, 42, 42], [41]):
+            with self.subTest(input_ids=input_ids):
+                with self.assertRaises(DashScParameterError):
+                    _multimodal_marker_count(list(input_ids), [[41, 42]])
+
+    def test_rejects_unsupported_marker_width(self) -> None:
+        with self.assertRaises(DashScParameterError):
+            _multimodal_marker_count([1, 2, 3], [[1, 2, 3]])
 
 
 class BuildThinkRuntimeTest(unittest.TestCase):
@@ -686,6 +726,8 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         )
 
         env_cfg = _GenerateEnvCfg()
+        mm_input = MagicMock()
+        mm_input.mm_type = int(MMUrlType.IMAGE)
         chunks = await _drain(
             iter_real_model_stream_infer(
                 req,
@@ -701,12 +743,15 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
                 generate_env_config=env_cfg,
                 think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
                 phase2_request_id_factory=lambda: 200,
+                mm_inputs=[mm_input],
             )
         )
 
         self.assertEqual(visitor.enqueue_called, 2)
         self.assertEqual(visitor.generate_inputs[0].request_id, 100)
         self.assertEqual(visitor.generate_inputs[1].request_id, 200)
+        self.assertEqual(visitor.generate_inputs[0].mm_inputs, [mm_input])
+        self.assertEqual(visitor.generate_inputs[1].mm_inputs, [mm_input])
         self.assertTrue(visitor.generate_inputs[0].generate_config.in_think_mode)
         self.assertEqual(
             visitor.generate_inputs[0].generate_config.begin_think_token_ids,
@@ -1649,6 +1694,222 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
             aux_info=AuxInfo(input_len=1, reuse_len=0),
         )
         return _FakeVisitor(_FakeAsyncStream([GenerateOutputs(generate_outputs=[out])]))
+
+    def _valid_multimodal_request(
+        self, image: np.ndarray | None = None
+    ) -> predict_v2_pb2.ModelInferRequest:
+        req = self._valid_infer_request()
+        input_ids = [7, 101, 55, 102, 8]
+        req.inputs[0].shape[:] = [len(input_ids)]
+        req.raw_input_contents[0] = struct.pack(f"<{len(input_ids)}i", *input_ids)
+        if image is None:
+            image = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)
+        _add_multimodal_image(req, image)
+        return req
+
+    async def test_multimodal_is_fail_closed_when_writer_flag_is_off(self) -> None:
+        visitor = self._terminal_visitor()
+        servicer = DashScInferenceServicer(backend_visitor=visitor)
+        request = self._valid_multimodal_request()
+
+        with patch(
+            "rtp_llm.dash_sc.inference.servicer.parse_multi_modal_data_from_request"
+        ) as parser:
+            responses = await _drain(
+                servicer.ModelStreamInfer(_areq_iter([request]), _FakeGrpcContext())
+            )
+
+        self.assertEqual(visitor.enqueue_called, 0)
+        parser.assert_not_called()
+        self.assertEqual(len(responses), 1)
+        _assert_parameter_error_response(self, responses[0], "disabled")
+
+    async def test_real_numpy_fixture_becomes_empty_url_uint8_hwc_tensor(
+        self,
+    ) -> None:
+        image = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3)
+        visitor = self._terminal_visitor()
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            multimodal_tensor_enabled=True,
+            mm_sep_tokens=[[101, 102]],
+        )
+
+        with patch("rtp_llm.dash_sc.inference.servicer.logging.debug") as debug:
+            responses = await _drain(
+                servicer.ModelStreamInfer(
+                    _areq_iter([self._valid_multimodal_request(image)]),
+                    _FakeGrpcContext(),
+                )
+            )
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(visitor.enqueue_called, 1)
+        self.assertEqual(len(visitor.last_generate_input.mm_inputs), 1)
+        mm_input = visitor.last_generate_input.mm_inputs[0]
+        self.assertEqual(mm_input.url, "")
+        self.assertEqual(mm_input.mm_type, int(MMUrlType.IMAGE))
+        self.assertEqual(mm_input.tensor.dtype, torch.uint8)
+        self.assertEqual(tuple(mm_input.tensor.shape), (2, 3, 3))
+        self.assertTrue(torch.equal(mm_input.tensor, torch.from_numpy(image)))
+        self.assertNotIn("data:image", mm_input.to_string())
+        debug_calls = repr(debug.call_args_list)
+        self.assertNotIn("data:image", debug_calls)
+        self.assertNotIn("tensor([[[", debug_calls)
+
+    async def test_marker_mismatch_rejected_after_parse_and_releases_slot(
+        self,
+    ) -> None:
+        visitor = self._terminal_visitor()
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            multimodal_tensor_enabled=True,
+            mm_sep_tokens=[[101, 102]],
+        )
+        request = self._valid_infer_request()
+        _add_multimodal_image(request, np.zeros((2, 2, 3), dtype=np.uint8))
+        gate = MagicMock()
+        gate.acquire = AsyncMock()
+        servicer._multimodal_semaphore = gate
+
+        responses = await _drain(
+            servicer.ModelStreamInfer(_areq_iter([request]), _FakeGrpcContext())
+        )
+
+        self.assertEqual(visitor.enqueue_called, 0)
+        _assert_parameter_error_response(self, responses[0], "marker count")
+        gate.acquire.assert_awaited_once_with()
+        gate.release.assert_called_once_with()
+
+    async def test_parser_error_releases_multimodal_slot(self) -> None:
+        visitor = self._terminal_visitor()
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            multimodal_tensor_enabled=True,
+            mm_sep_tokens=[[101, 102]],
+        )
+        request = self._valid_infer_request()
+        request.inputs[0].shape[:] = [2]
+        request.raw_input_contents[0] = struct.pack("<2i", 101, 102)
+        _add_input_tensor(
+            request,
+            "multi_modal_data",
+            "BYTES",
+            [1],
+            struct.pack("<I", 3) + b"bad",
+        )
+        gate = MagicMock()
+        gate.acquire = AsyncMock()
+        servicer._multimodal_semaphore = gate
+
+        responses = await _drain(
+            servicer.ModelStreamInfer(_areq_iter([request]), _FakeGrpcContext())
+        )
+
+        self.assertEqual(visitor.enqueue_called, 0)
+        self.assertEqual(len(responses), 1)
+        gate.acquire.assert_awaited_once_with()
+        gate.release.assert_called_once_with()
+
+    async def test_backend_error_releases_multimodal_slot(self) -> None:
+        visitor = _FakeVisitor(_FakeAsyncStream([], raise_after=0))
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            multimodal_tensor_enabled=True,
+            mm_sep_tokens=[[101, 102]],
+        )
+        gate = MagicMock()
+        gate.acquire = AsyncMock()
+        servicer._multimodal_semaphore = gate
+
+        responses = await _drain(
+            servicer.ModelStreamInfer(
+                _areq_iter([self._valid_multimodal_request()]),
+                _FakeGrpcContext(),
+            )
+        )
+
+        self.assertEqual(visitor.enqueue_called, 1)
+        self.assertEqual(len(responses), 1)
+        _, error = _dash_error_payload(responses[0])
+        self.assertIn("backend down", error["status_message"])
+        gate.acquire.assert_awaited_once_with()
+        gate.release.assert_called_once_with()
+
+    async def test_task_cancellation_releases_multimodal_slot(self) -> None:
+        stream_started = asyncio.Event()
+
+        class _BlockingStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                stream_started.set()
+                await asyncio.Future()
+
+        visitor = _FakeVisitor(_BlockingStream())
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            multimodal_tensor_enabled=True,
+            mm_sep_tokens=[[101, 102]],
+        )
+        gate = MagicMock()
+        gate.acquire = AsyncMock()
+        servicer._multimodal_semaphore = gate
+        task = asyncio.create_task(
+            _drain(
+                servicer.ModelStreamInfer(
+                    _areq_iter([self._valid_multimodal_request()]),
+                    _FakeGrpcContext(),
+                )
+            )
+        )
+        try:
+            await asyncio.wait_for(stream_started.wait(), timeout=1.0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        self.assertEqual(visitor.enqueue_called, 1)
+        gate.acquire.assert_awaited_once_with()
+        gate.release.assert_called_once_with()
+
+    async def test_pure_text_never_acquires_multimodal_slot(self) -> None:
+        visitor = self._terminal_visitor()
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            multimodal_tensor_enabled=True,
+            mm_sep_tokens=[[101, 102]],
+        )
+        gate = MagicMock()
+        gate.acquire = AsyncMock()
+        servicer._multimodal_semaphore = gate
+
+        await _drain(
+            servicer.ModelStreamInfer(
+                _areq_iter([self._valid_infer_request()]), _FakeGrpcContext()
+            )
+        )
+
+        self.assertEqual(visitor.enqueue_called, 1)
+        gate.acquire.assert_not_awaited()
+        gate.release.assert_not_called()
+
+    def test_enabled_writer_requires_model_markers_and_positive_limit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "multimodal markers"):
+            DashScInferenceServicer(
+                backend_visitor=self._terminal_visitor(),
+                multimodal_tensor_enabled=True,
+            )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            DashScInferenceServicer(
+                backend_visitor=self._terminal_visitor(),
+                max_inflight_multimodal_requests=0,
+            )
 
     async def test_access_log_records_input_and_generated_ids(self) -> None:
         # Frontend struct path: the emitted access line carries the real token

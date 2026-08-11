@@ -20,9 +20,12 @@ from rtp_llm.dash_sc.app import (
     _abort_bind_barrier,
     _create_proxy_servicer_on_loop,
     _derive_echo_prefix_ids,
+    _is_multimodal_tensor_enabled,
     _is_proxy_mode_enabled,
     _pre_stop_drain_seconds,
     _wait_for_bind_barrier,
+    _resolve_multimodal_max_concurrent_rpcs,
+    _resolve_multimodal_tensor_enabled,
 )
 from rtp_llm.dash_sc.server import DashScGrpcDrainAioInterceptor, DashScGrpcServer
 
@@ -206,6 +209,127 @@ class ProxyModeEnvTest(TestCase):
             clear=True,
         ):
             self.assertTrue(_is_proxy_mode_enabled())
+
+
+class MultimodalTensorWriterEnvTest(TestCase):
+    def test_default_and_truthy_words_remain_disabled(self) -> None:
+        for value in (None, "", "0", "true", "yes"):
+            env = {} if value is None else {"DASH_SC_MULTIMODAL_TENSOR_ENABLED": value}
+            with self.subTest(value=value), patch.dict(os.environ, env, clear=True):
+                self.assertFalse(_is_multimodal_tensor_enabled())
+
+    def test_only_explicit_one_enables_target_writer(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DASH_SC_MULTIMODAL_TENSOR_ENABLED": " 1 "},
+            clear=True,
+        ):
+            self.assertTrue(_is_multimodal_tensor_enabled())
+
+
+class MultimodalTensorWriterCapabilityTest(TestCase):
+    @staticmethod
+    def _model_config(
+        model_type: str,
+        *,
+        is_multimodal: bool = True,
+        mm_sep_tokens=None,
+    ):
+        return SimpleNamespace(
+            model_type=model_type,
+            mm_model_config=SimpleNamespace(
+                is_multimodal=is_multimodal,
+                mm_sep_tokens=(
+                    [[101, 102]] if mm_sep_tokens is None else mm_sep_tokens
+                ),
+            ),
+        )
+
+    def test_disabled_env_does_not_require_model_capability(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                _resolve_multimodal_tensor_enabled(
+                    SimpleNamespace(model_type="unsupported")
+                )
+            )
+
+    def test_supported_model_types_enable_raw_tensor_forwarding(self) -> None:
+        for model_type in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen35_moe",
+            "qwen35_dense",
+        ):
+            with self.subTest(model_type=model_type), patch.dict(
+                os.environ,
+                {"DASH_SC_MULTIMODAL_TENSOR_ENABLED": "1"},
+                clear=True,
+            ):
+                self.assertTrue(
+                    _resolve_multimodal_tensor_enabled(self._model_config(model_type))
+                )
+
+    def test_model_type_allowlist_is_exact_and_fail_closed(self) -> None:
+        for model_type in (
+            "qwen2_vl",
+            "qwen35_moe_mtp",
+            "qwen35_moe_custom",
+            "QWEN35_MOE",
+            "",
+        ):
+            with self.subTest(model_type=model_type), patch.dict(
+                os.environ,
+                {"DASH_SC_MULTIMODAL_TENSOR_ENABLED": "1"},
+                clear=True,
+            ), self.assertRaisesRegex(ValueError, "model_type"):
+                _resolve_multimodal_tensor_enabled(self._model_config(model_type))
+
+    def test_supported_type_must_be_an_active_multimodal_model(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DASH_SC_MULTIMODAL_TENSOR_ENABLED": "1"},
+            clear=True,
+        ), self.assertRaisesRegex(ValueError, "active multimodal model"):
+            _resolve_multimodal_tensor_enabled(
+                self._model_config("qwen35_moe", is_multimodal=False)
+            )
+
+    def test_supported_type_must_define_multimodal_markers(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DASH_SC_MULTIMODAL_TENSOR_ENABLED": "1"},
+            clear=True,
+        ), self.assertRaisesRegex(ValueError, "multimodal markers"):
+            _resolve_multimodal_tensor_enabled(
+                self._model_config("qwen35_moe", mm_sep_tokens=[])
+            )
+
+
+class MultimodalTensorAdmissionTest(TestCase):
+    def test_disabled_writer_keeps_existing_unbounded_admission(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(_resolve_multimodal_max_concurrent_rpcs(False))
+
+    def test_enabled_writer_defaults_to_one_rpc_per_process(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_resolve_multimodal_max_concurrent_rpcs(True), 1)
+
+    def test_explicit_small_limit_is_supported(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DASH_SC_MULTIMODAL_MAX_CONCURRENT_RPCS": " 4 "},
+            clear=True,
+        ):
+            self.assertEqual(_resolve_multimodal_max_concurrent_rpcs(True), 4)
+
+    def test_invalid_or_unsafe_limits_fail_closed(self) -> None:
+        for value in ("", "no", "0", "5", "-1"):
+            with self.subTest(value=value), patch.dict(
+                os.environ,
+                {"DASH_SC_MULTIMODAL_MAX_CONCURRENT_RPCS": value},
+                clear=True,
+            ), self.assertRaisesRegex(ValueError, "MAX_CONCURRENT_RPCS"):
+                _resolve_multimodal_max_concurrent_rpcs(True)
 
 
 class PreStopDrainSecondsTest(TestCase):
@@ -529,12 +653,19 @@ class DashScGrpcServerStopTest(TestCase):
             with patch(
                 "rtp_llm.dash_sc.server.grpc.aio.server",
                 return_value=fake_server,
-            ), patch(
+            ) as server_factory, patch(
                 "rtp_llm.dash_sc.server.predict_v2_pb2_grpc."
                 "add_GRPCInferenceServiceServicer_to_server"
             ):
                 with self.assertRaisesRegex(RuntimeError, "0\\.0\\.0\\.0:12345"):
-                    await grpc_server.start(12345, servicer=Mock())
+                    await grpc_server.start(
+                        12345,
+                        servicer=Mock(),
+                        maximum_concurrent_rpcs=2,
+                    )
+                self.assertEqual(
+                    server_factory.call_args.kwargs["maximum_concurrent_rpcs"], 2
+                )
 
         asyncio.run(run())
         fake_server.add_insecure_port.assert_called_once_with("0.0.0.0:12345")

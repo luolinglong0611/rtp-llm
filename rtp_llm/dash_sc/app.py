@@ -48,6 +48,18 @@ if TYPE_CHECKING:
 
 _PROXY_MODE_ENV_KEY = "DASH_SC_GRPC_PROXY_MODE"
 _FORWARD_ENV_KEY = "DASH_SC_GRPC_FORWARD_ADDR"
+_MULTIMODAL_TENSOR_ENABLED_ENV_KEY = "DASH_SC_MULTIMODAL_TENSOR_ENABLED"
+_MULTIMODAL_MAX_CONCURRENT_RPCS_ENV_KEY = "DASH_SC_MULTIMODAL_MAX_CONCURRENT_RPCS"
+_DEFAULT_MULTIMODAL_MAX_CONCURRENT_RPCS = 1
+_MAX_MULTIMODAL_MAX_CONCURRENT_RPCS = 4
+_MULTIMODAL_TENSOR_MODEL_TYPES = frozenset(
+    {
+        "qwen3_vl",
+        "qwen3_vl_moe",
+        "qwen35_moe",
+        "qwen35_dense",
+    }
+)
 
 _PROXY_SERVICER_STARTUP_TIMEOUT_S = 30.0
 _SERVICER_CLOSE_TIMEOUT_S = 10.0
@@ -118,6 +130,64 @@ def _abort_bind_barrier(bind_barrier) -> None:
         bind_barrier.abort()
     except Exception as e:
         logging.warning("[DashScApp] failed to abort gRPC bind barrier: %s", e)
+
+
+def _is_multimodal_tensor_enabled() -> bool:
+    """Enable the request writer only for the explicit target-level value ``1``."""
+    return os.environ.get(_MULTIMODAL_TENSOR_ENABLED_ENV_KEY, "").strip() == "1"
+
+
+def _resolve_multimodal_tensor_enabled(model_config: ModelConfig) -> bool:
+    """Validate the active model before enabling raw image tensor forwarding."""
+    if not _is_multimodal_tensor_enabled():
+        return False
+
+    model_type = str(getattr(model_config, "model_type", ""))
+    if model_type not in _MULTIMODAL_TENSOR_MODEL_TYPES:
+        raise ValueError(
+            f"{_MULTIMODAL_TENSOR_ENABLED_ENV_KEY}=1 requires a model with "
+            f"raw image tensor preprocessing support; got model_type={model_type!r}"
+        )
+
+    mm_model_config = getattr(model_config, "mm_model_config", None)
+    if mm_model_config is None or not bool(
+        getattr(mm_model_config, "is_multimodal", False)
+    ):
+        raise ValueError(
+            f"{_MULTIMODAL_TENSOR_ENABLED_ENV_KEY}=1 requires an active "
+            f"multimodal model; got model_type={model_type!r}"
+        )
+    if not getattr(mm_model_config, "mm_sep_tokens", None):
+        raise ValueError(
+            f"{_MULTIMODAL_TENSOR_ENABLED_ENV_KEY}=1 requires model multimodal "
+            f"markers; got model_type={model_type!r}"
+        )
+    return True
+
+
+def _resolve_multimodal_max_concurrent_rpcs(
+    multimodal_tensor_enabled: bool,
+) -> Optional[int]:
+    """Bound request admission while a process may retain 70.56 MB images."""
+    if not multimodal_tensor_enabled:
+        return None
+
+    raw_value = os.environ.get(
+        _MULTIMODAL_MAX_CONCURRENT_RPCS_ENV_KEY,
+        str(_DEFAULT_MULTIMODAL_MAX_CONCURRENT_RPCS),
+    ).strip()
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_MULTIMODAL_MAX_CONCURRENT_RPCS_ENV_KEY} must be an integer"
+        ) from exc
+    if value < 1 or value > _MAX_MULTIMODAL_MAX_CONCURRENT_RPCS:
+        raise ValueError(
+            f"{_MULTIMODAL_MAX_CONCURRENT_RPCS_ENV_KEY} must be between 1 and "
+            f"{_MAX_MULTIMODAL_MAX_CONCURRENT_RPCS}; got {value}"
+        )
+    return value
 
 
 class DashScShutdownManager:
@@ -556,6 +626,7 @@ class DashScApp:
         try:
             port = self.server_config.dash_sc_grpc_server_port
             is_proxy = _is_proxy_mode_enabled()
+            multimodal_max_concurrent_rpcs: Optional[int] = None
 
             # Proxy mode skips model / weight loading / visitor construction;
             # the servicer is opened below on the owner loop for a consistent
@@ -570,6 +641,12 @@ class DashScApp:
                     embedding_config=self.py_env_configs.embedding_config,
                     quantization_config=self.py_env_configs.quantization_config,
                     render_config=self.py_env_configs.render_config,
+                )
+                multimodal_tensor_enabled = _resolve_multimodal_tensor_enabled(
+                    model_config
+                )
+                multimodal_max_concurrent_rpcs = (
+                    _resolve_multimodal_max_concurrent_rpcs(multimodal_tensor_enabled)
                 )
 
                 backend_visitor = create_backend_rpc_server_visitor(
@@ -619,6 +696,11 @@ class DashScApp:
                     think_runtime=think_runtime,
                     rank_id=self.server_config.rank_id,
                     repetition_monitor_config=repetition_monitor_config,
+                    multimodal_tensor_enabled=multimodal_tensor_enabled,
+                    mm_sep_tokens=model_config.mm_model_config.mm_sep_tokens,
+                    max_inflight_multimodal_requests=(
+                        multimodal_max_concurrent_rpcs or 1
+                    ),
                 )
 
             loop = self._start_enqueue_loop()
@@ -663,6 +745,7 @@ class DashScApp:
                 log_path=get_log_path(),
                 backup_count=self.py_env_configs.profiling_debug_logging_config.log_file_backup_count,
                 rank_id=self.server_config.rank_id,
+                maximum_concurrent_rpcs=multimodal_max_concurrent_rpcs,
             )
             logging.info("[DashScApp] gRPC server bound on port %s", port)
         except BaseException as e:

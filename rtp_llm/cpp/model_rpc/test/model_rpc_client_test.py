@@ -2,7 +2,7 @@ import asyncio
 import json
 import struct
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Mock the ops module to avoid CUDA dependency in this unit test
 # This MUST be at the very top before any other imports, even before unittest
@@ -21,18 +21,20 @@ sys.modules["rtp_llm.ops.comm.nccl_op"] = mock_nccl_op
 import logging
 import os
 import unittest
+from types import SimpleNamespace
 from typing import AsyncGenerator
 from unittest import TestCase, main
 
 import torch
 
-from rtp_llm.config.generate_config import GenerateConfig
+from rtp_llm.config.generate_config import GenerateConfig, RoleType
 from rtp_llm.config.log_config import setup_logging
 from rtp_llm.config.response_format_compiler import ReasoningFormat
 from rtp_llm.cpp.model_rpc.model_rpc_client import (
     ModelRpcClient,
     StreamState,
     trans_input,
+    trans_multimodal_input,
     trans_output,
 )
 from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
@@ -87,6 +89,20 @@ class FakeStub:
         yield outputs_pb3
 
 
+class EmptyResponseIterator:
+    def __init__(self):
+        self.cancelled = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+    def cancel(self):
+        self.cancelled = True
+
+
 class FakeModelRpcClient(ModelRpcClient):
     def __init__(self):
         # Call parent __init__ with minimal required parameters
@@ -119,6 +135,114 @@ class ModelRpcClientTest(TestCase):
         async for res in client.enqueue(input):
             responses.extend(res.generate_outputs)
         return responses
+
+    @staticmethod
+    def _mm_input(url, tensor):
+        return SimpleNamespace(
+            url=url,
+            tensor=tensor,
+            mm_type=1,
+            mm_preprocess_config=SimpleNamespace(
+                width=-1,
+                height=-1,
+                min_pixels=-1,
+                max_pixels=-1,
+                fps=-1,
+                min_frames=-1,
+                max_frames=-1,
+                crop_positions=[],
+                mm_timeout_ms=30000,
+            ),
+        )
+
+    def test_trans_multimodal_input_serializes_uint8_tensor(self):
+        tensor = torch.arange(18, dtype=torch.uint8).reshape(2, 3, 3)
+        input_pb = GenerateInputPB()
+
+        trans_multimodal_input(
+            SimpleNamespace(mm_inputs=[self._mm_input("", tensor)]),
+            input_pb,
+            GenerateConfig(),
+        )
+
+        mm_input_pb = input_pb.multimodal_inputs[0]
+        self.assertEqual(mm_input_pb.multimodal_url, "")
+        self.assertTrue(mm_input_pb.HasField("multimodal_tensor"))
+        self.assertEqual(
+            mm_input_pb.multimodal_tensor.data_type, TensorPB.DataType.UINT8
+        )
+        self.assertEqual(list(mm_input_pb.multimodal_tensor.shape), [2, 3, 3])
+        self.assertEqual(mm_input_pb.multimodal_tensor.uint8_data, bytes(range(18)))
+
+    def test_trans_multimodal_input_keeps_legacy_url_without_tensor(self):
+        input_pb = GenerateInputPB()
+
+        trans_multimodal_input(
+            SimpleNamespace(
+                mm_inputs=[self._mm_input("memory://image", torch.empty(0))]
+            ),
+            input_pb,
+            GenerateConfig(),
+        )
+
+        mm_input_pb = input_pb.multimodal_inputs[0]
+        self.assertEqual(mm_input_pb.multimodal_url, "memory://image")
+        self.assertFalse(mm_input_pb.HasField("multimodal_tensor"))
+
+    def test_trans_multimodal_input_rejects_both_or_neither_source(self):
+        for mm_input in (
+            self._mm_input("memory://image", torch.ones(1, dtype=torch.uint8)),
+            self._mm_input("", torch.empty(0)),
+        ):
+            with self.subTest(url=mm_input.url), self.assertRaisesRegex(
+                ValueError, "exactly one"
+            ):
+                trans_multimodal_input(
+                    SimpleNamespace(mm_inputs=[mm_input]),
+                    GenerateInputPB(),
+                    GenerateConfig(),
+                )
+
+    def test_enqueue_serializes_once_after_role_routing(self):
+        client = ModelRpcClient(["default:9000"], {}, 0, False)
+        channel_pool = SimpleNamespace(get=AsyncMock(return_value=object()))
+        client._channel_pool = channel_pool
+        response_iterator = EmptyResponseIterator()
+        stub = MagicMock()
+        stub.GenerateStreamCall.return_value = response_iterator
+        generate_config = GenerateConfig()
+        generate_config.role_addrs = [
+            SimpleNamespace(
+                role=RoleType.PREFILL,
+                ip="prefill-host",
+                http_port=0,
+                grpc_port=12345,
+            )
+        ]
+        input_py = GenerateInput(
+            request_id=7,
+            token_ids=torch.tensor([1, 2], dtype=torch.int32),
+            mm_inputs=[],
+            generate_config=generate_config,
+        )
+
+        async def drain():
+            return [output async for output in client.enqueue(input_py)]
+
+        with patch(
+            "rtp_llm.cpp.model_rpc.model_rpc_client.trans_input",
+            wraps=trans_input,
+        ) as trans_input_spy, patch(
+            "rtp_llm.cpp.model_rpc.model_rpc_client.RpcServiceStub",
+            return_value=stub,
+        ):
+            outputs = asyncio.run(drain())
+
+        self.assertEqual(outputs, [])
+        self.assertEqual(trans_input_spy.call_count, 1)
+        channel_pool.get.assert_awaited_once_with("prefill-host:12345")
+        stub.GenerateStreamCall.assert_called_once()
+        self.assertTrue(response_iterator.cancelled)
 
     def test_trans_input_serializes_typed_request_info(self):
         input_py = GenerateInput(

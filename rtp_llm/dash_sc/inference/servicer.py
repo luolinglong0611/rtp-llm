@@ -14,6 +14,7 @@ coroutine automatically.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from dataclasses import dataclass
@@ -55,12 +56,15 @@ from rtp_llm.dash_sc.codec import (
     DashScParameterError,
     DashScRequestControls,
     LLMFinishReason,
+    ParsedRGBImage,
     SamplingParams,
     _token_ids_list_from_generate_output,
     build_dash_error_response,
     build_stream_response_from_generate_outputs,
     parse_dash_sc_grpc_request,
+    parse_multi_modal_data_from_request,
     prepend_to_generated_ids_tensor,
+    request_has_multi_modal_data,
 )
 from rtp_llm.dash_sc.grpc_metrics import (
     report_arrival,
@@ -71,6 +75,7 @@ from rtp_llm.dash_sc.proto import predict_v2_pb2, predict_v2_pb2_grpc
 from rtp_llm.dash_sc.repetition_monitor import RequestRepetitionMonitorConfig
 from rtp_llm.frontend.request_id_generator import generate_request_id
 from rtp_llm.metrics import AccMetrics, kmonitor
+from rtp_llm.ops import MMPreprocessConfig, MultimodalInput
 from rtp_llm.server.request_headers import (
     extract_correlation_request_id,
     extract_request_headers,
@@ -79,6 +84,7 @@ from rtp_llm.server.request_headers import (
 from rtp_llm.utils.base_model_datatypes import (
     GenerateInput,
     GenerateOutputs,
+    MMUrlType,
     RequestInfo,
 )
 from rtp_llm.utils.util import AtomicCounter
@@ -103,6 +109,114 @@ _EMPTY_THINK_PHASE2_MODEL_TYPES = {"deepseek_v4"}
 _INT32_MAX = 2_147_483_647
 _PARTIAL_RESPONSE_METADATA = (("x-dashscope-partialresponse", "true"),)
 GrpcMetadata = Iterable[tuple[object, object]]
+
+
+def _default_mm_preprocess_config() -> MMPreprocessConfig:
+    return MMPreprocessConfig(-1, -1, -1, -1, -1, -1, -1, [], 30000)
+
+
+def _build_multimodal_inputs(
+    images: Iterable[ParsedRGBImage],
+) -> list[MultimodalInput]:
+    """Wrap validated request-backed RGB bytes as native uint8 HWC tensors."""
+    mm_inputs: list[MultimodalInput] = []
+    for image in images:
+        if not isinstance(image, ParsedRGBImage):
+            raise DashScParameterError(
+                "multi_modal_data did not decode to a validated RGB image"
+            )
+        expected_bytes = image.height * image.width * 3
+        if image.pixels.nbytes != expected_bytes:
+            raise DashScParameterError(
+                "multi_modal_data RGB byte length does not match image shape"
+            )
+        try:
+            # The tensor is read-only on this FrontApp path: Model RPC only
+            # serializes it.  ``frombuffer`` keeps the validated request bytes
+            # alive without another tensor-sized allocation at this step.
+            tensor = torch.frombuffer(image.pixels, dtype=torch.uint8).reshape(
+                image.height, image.width, 3
+            )
+            mm_inputs.append(
+                MultimodalInput(
+                    "",
+                    MMUrlType.IMAGE,
+                    tensor,
+                    _default_mm_preprocess_config(),
+                )
+            )
+        except Exception as exc:
+            raise DashScParameterError(
+                "multi_modal_data could not be converted to a multimodal input"
+            ) from exc
+    return mm_inputs
+
+
+def _multimodal_marker_count(
+    input_ids: list[int], mm_sep_tokens: Iterable[Iterable[int]]
+) -> int:
+    """Count complete model-defined media markers in a tokenized prompt."""
+    marker_count = 0
+    for raw_marker in mm_sep_tokens:
+        marker = [int(token_id) for token_id in raw_marker]
+        if len(marker) == 1:
+            marker_count += input_ids.count(marker[0])
+            continue
+        if len(marker) == 2:
+            left_count = 0
+            right_count = 0
+            for token_id in input_ids:
+                if token_id == marker[0]:
+                    if right_count != left_count:
+                        raise DashScParameterError("unmatched multimodal tag pairs")
+                    left_count += 1
+                elif token_id == marker[1]:
+                    right_count += 1
+                    if right_count != left_count:
+                        raise DashScParameterError("unmatched multimodal tag pairs")
+            if left_count != right_count:
+                raise DashScParameterError("unclosed multimodal tag pairs")
+            marker_count += left_count
+            continue
+        raise DashScParameterError(
+            "multimodal marker definitions must contain one or two tokens"
+        )
+    return marker_count
+
+
+def _validate_multimodal_alignment(
+    input_ids: list[int],
+    mm_inputs: list[MultimodalInput],
+    mm_sep_tokens: Iterable[Iterable[int]],
+) -> None:
+    markers = [list(marker) for marker in mm_sep_tokens]
+    if not markers:
+        if mm_inputs:
+            raise DashScParameterError(
+                "multi_modal_data is unsupported by the active model"
+            )
+        return
+    marker_count = _multimodal_marker_count(input_ids, markers)
+    if marker_count != len(mm_inputs):
+        raise DashScParameterError(
+            "multimodal image count does not match the prompt marker count: "
+            f"images={len(mm_inputs)} markers={marker_count}"
+        )
+
+
+def _log_generate_input_summary(
+    tag: str, label: str, generate_input: GenerateInput
+) -> None:
+    """Log routing metadata without rendering tensor contents."""
+    mm_inputs = list(generate_input.mm_inputs or ())
+    logging.debug(
+        "[DashScGrpc] [%s] %s: input_len=%s mm_count=%s mm_types=%s",
+        tag,
+        label,
+        int(generate_input.token_ids.numel()),
+        len(mm_inputs),
+        [int(mm_input.mm_type) for mm_input in mm_inputs],
+    )
 
 
 def _exception_metric_code(error_code: int | ExceptionType) -> str:
@@ -459,6 +573,7 @@ def _make_generate_input(
     generate_config: GenerateConfig,
     invocation_metadata: Optional[GrpcMetadata],
     request_headers: Optional[dict[str, str]] = None,
+    mm_inputs: Optional[Iterable[MultimodalInput]] = None,
 ) -> GenerateInput:
     headers = dict(request_headers or {})
     headers.update(_headers_from_invocation_metadata(invocation_metadata))
@@ -466,7 +581,7 @@ def _make_generate_input(
     return GenerateInput(
         request_id=request_id,
         token_ids=torch.tensor(input_ids_list, dtype=torch.int),
-        mm_inputs=[],
+        mm_inputs=list(mm_inputs or ()),
         generate_config=generate_config,
         headers=headers,
         request_info=RequestInfo(
@@ -585,6 +700,7 @@ async def iter_real_model_stream_infer(
     phase2_request_id_factory: Optional[Callable[[], int]] = None,
     access_agg: GrpcAccessRecord | None = None,
     yield_access_stats: bool = False,
+    mm_inputs: Optional[Iterable[MultimodalInput]] = None,
 ) -> AsyncIterator[predict_v2_pb2.ModelStreamInferResponse]:
     """Run enqueue on ``backend_visitor`` and yield one proto per chunk as the backend streams.
 
@@ -617,6 +733,7 @@ async def iter_real_model_stream_infer(
     trace_str = str(request.id)
     tag = stream_log_tag(request_id_numeric=rtp_llm_request_id, trace_id=trace_str)
     runtime = think_runtime if think_runtime is not None else _ThinkRuntime()
+    request_mm_inputs = tuple(mm_inputs or ())
     logging.debug(
         "[DashScGrpc] [%s] real infer start: model_name=%s input_len=%s sampling=%s",
         tag,
@@ -692,9 +809,10 @@ async def iter_real_model_stream_infer(
             generate_config=generate_config,
             invocation_metadata=invocation_metadata,
             request_headers=request_controls.request_headers,
+            mm_inputs=request_mm_inputs,
         )
         is_streaming = bool(generate_config.is_streaming)
-        logging.debug("[DashScGrpc] [%s] generate_input: %s", tag, generate_input)
+        _log_generate_input_summary(tag, "generate_input", generate_input)
         request_shape = list(request.inputs[0].shape) if request.inputs else None
         chunk_idx = 0
         phase2_needed = False
@@ -1004,11 +1122,10 @@ async def iter_real_model_stream_infer(
                 generate_config=phase2_config,
                 invocation_metadata=invocation_metadata,
                 request_headers=request_controls.request_headers,
+                mm_inputs=request_mm_inputs,
             )
-            logging.debug(
-                "[DashScGrpc] [%s] phase-2 generate_input: %s",
-                phase2_tag,
-                phase2_generate_input,
+            _log_generate_input_summary(
+                phase2_tag, "phase-2 generate_input", phase2_generate_input
             )
             phase2_stream = await backend_visitor.enqueue(phase2_generate_input)
             phase2_cumulative_sent_ids: list[int] = []
@@ -1243,6 +1360,9 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         think_runtime: Optional[_ThinkRuntime] = None,
         rank_id: Optional[int] = None,
         repetition_monitor_config: Optional[RequestRepetitionMonitorConfig] = None,
+        multimodal_tensor_enabled: bool = False,
+        mm_sep_tokens: Optional[Iterable[Iterable[int]]] = None,
+        max_inflight_multimodal_requests: int = 1,
     ):
         if backend_visitor is None:
             raise ValueError("backend_visitor is required for DashScInferenceServicer")
@@ -1275,6 +1395,20 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         self._rank_id = rank_id
         self._server_id = to_optional_int(server_id)
         self._rep_cfg = repetition_monitor_config or RequestRepetitionMonitorConfig()
+        self._multimodal_tensor_enabled = bool(multimodal_tensor_enabled)
+        self._mm_sep_tokens = tuple(
+            tuple(int(token_id) for token_id in marker)
+            for marker in (mm_sep_tokens or ())
+        )
+        if max_inflight_multimodal_requests <= 0:
+            raise ValueError("max_inflight_multimodal_requests must be positive")
+        if self._multimodal_tensor_enabled and not self._mm_sep_tokens:
+            raise ValueError(
+                "DASH_SC_MULTIMODAL_TENSOR_ENABLED requires model multimodal markers"
+            )
+        self._multimodal_semaphore = asyncio.Semaphore(
+            int(max_inflight_multimodal_requests)
+        )
 
     def _record_and_report_chunk(
         self,
@@ -1358,6 +1492,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         emit_query_log(record, rank_id=self._rank_id, server_id=self._server_id)
         report_arrival(rank_id=self._rank_id, server_id=self._server_id)
         exc: Optional[BaseException] = None
+        multimodal_slot_acquired = False
         try:
             try:
                 invocation_metadata = context.invocation_metadata()
@@ -1373,9 +1508,25 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     request.model_name,
                 )
                 try:
+                    has_multi_modal_data = request_has_multi_modal_data(request)
+                    if has_multi_modal_data:
+                        if not self._multimodal_tensor_enabled:
+                            raise DashScParameterError(
+                                "multi_modal_data tensor forwarding is disabled for this deployment"
+                            )
+                        await self._multimodal_semaphore.acquire()
+                        multimodal_slot_acquired = True
+                        parsed_images = parse_multi_modal_data_from_request(request)
+                        mm_inputs = _build_multimodal_inputs(parsed_images)
+                    else:
+                        mm_inputs = []
                     input_ids_list, sampling, request_controls = (
                         parse_dash_sc_grpc_request(request)
                     )
+                    if self._multimodal_tensor_enabled:
+                        _validate_multimodal_alignment(
+                            input_ids_list or [], mm_inputs, self._mm_sep_tokens
+                        )
                 except DashScParameterError as e:
                     if first_request:
                         record.record_request_frame(request)
@@ -1477,6 +1628,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     phase2_request_id_factory=self._next_rtp_llm_request_id,
                     access_agg=record,
                     yield_access_stats=True,
+                    mm_inputs=mm_inputs,
                 ):
                     (
                         delta_len,
@@ -1504,6 +1656,8 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             exc = e
             raise
         finally:
+            if multimodal_slot_acquired:
+                self._multimodal_semaphore.release()
             end_ts = record.resolve_status(context, exc)
             # Log first, metrics second — a kmonitor hiccup must never delay or
             # drop the access record (user-mandated ordering).

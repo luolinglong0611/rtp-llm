@@ -35,6 +35,8 @@ from rtp_llm.utils.base_model_datatypes import MMUrlType
 from rtp_llm.utils.flash_attn_utils import can_use_flash_attn
 
 default_attn_impl = "sdpa"
+QWEN3_VL_TENSOR_MAX_PIXELS = 23_520_000
+QWEN3_VL_TENSOR_MAX_BYTES = QWEN3_VL_TENSOR_MAX_PIXELS * 3
 try:
     if can_use_flash_attn():
         default_attn_impl = "flash_attention_2"
@@ -85,14 +87,75 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
         do_resize = True
         if mm_type == MMUrlType.DEFAULT or mm_type == MMUrlType.IMAGE:
             tags = {"model": "qwen3_vl", "mm_type": "image"}
-            with vit_preprocess_timer(GaugeMetrics.VIT_IMAGE_FETCH_RT_US_METRIC, tags):
-                image_data = get_bytes_io_from_url(
-                    mm_input.url, vit_config.download_headers
+            tensor = getattr(mm_input, "tensor", None)
+            if tensor is not None and not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"Qwen3-VL image tensor must be a torch.Tensor, got {type(tensor)}"
                 )
-            with vit_preprocess_timer(GaugeMetrics.VIT_IMAGE_DECODE_RT_US_METRIC, tags):
-                image = Image.open(image_data)
+            has_tensor = tensor is not None and tensor.numel() > 0
+            if has_tensor:
+                if mm_input.url:
+                    raise ValueError(
+                        "Qwen3-VL image input cannot contain both url and tensor"
+                    )
+                if tensor.device.type != "cpu":
+                    raise ValueError("Qwen3-VL image tensor must be on CPU")
+                if tensor.dtype != torch.uint8:
+                    raise ValueError("Qwen3-VL image tensor must have dtype uint8")
+                if tensor.ndim != 3 or tensor.shape[2] != 3:
+                    raise ValueError(
+                        "Qwen3-VL image tensor must have HWC shape with 3 channels"
+                    )
+                if tensor.shape[0] <= 0 or tensor.shape[1] <= 0:
+                    raise ValueError(
+                        "Qwen3-VL image tensor height and width must be positive"
+                    )
+                height, width, _ = tensor.shape
+                pixel_count = height * width
+                if (
+                    pixel_count > QWEN3_VL_TENSOR_MAX_PIXELS
+                    or tensor.numel() > QWEN3_VL_TENSOR_MAX_BYTES
+                ):
+                    raise ValueError(
+                        "Qwen3-VL image tensor exceeds the maximum of "
+                        f"{QWEN3_VL_TENSOR_MAX_PIXELS} pixels / "
+                        f"{QWEN3_VL_TENSOR_MAX_BYTES} bytes"
+                    )
+                if factor <= 0 or height % factor != 0 or width % factor != 0:
+                    raise ValueError(
+                        "Qwen3-VL image tensor height and width must be divisible "
+                        f"by the model image factor {factor}"
+                    )
+                if not tensor.is_contiguous():
+                    raise ValueError("Qwen3-VL image tensor must be contiguous")
+                # transformers==5.2.0 Qwen2VLImageProcessor accepts torch.Tensor
+                # and converts it to a NumPy view internally. Passing HWC
+                # directly avoids a full-size PIL RGB copy.
+                image = tensor
+                record_vit_preprocess_value(
+                    GaugeMetrics.VIT_RESIZED_PIXEL_COUNT_METRIC,
+                    width * height,
+                    tags,
+                )
+                do_resize = False
+            else:
+                if not mm_input.url:
+                    raise ValueError(
+                        "Qwen3-VL image input requires a non-empty url or tensor"
+                    )
+                with vit_preprocess_timer(
+                    GaugeMetrics.VIT_IMAGE_FETCH_RT_US_METRIC, tags
+                ):
+                    image_data = get_bytes_io_from_url(
+                        mm_input.url, vit_config.download_headers
+                    )
+                with vit_preprocess_timer(
+                    GaugeMetrics.VIT_IMAGE_DECODE_RT_US_METRIC, tags
+                ):
+                    image = Image.open(image_data)
             if (
-                mm_input.mm_preprocess_config.height != -1
+                not has_tensor
+                and mm_input.mm_preprocess_config.height != -1
                 and mm_input.mm_preprocess_config.width != -1
             ):
                 resized_height, resized_width = smart_resize(
@@ -110,7 +173,7 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
                     tags,
                 )
                 do_resize = False
-            elif (
+            elif not has_tensor and (
                 mm_input.mm_preprocess_config.max_pixels != -1
                 or mm_input.mm_preprocess_config.min_pixels != -1
             ):
@@ -145,8 +208,14 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
             with vit_preprocess_timer(
                 GaugeMetrics.VIT_IMAGE_PROCESSOR_RT_US_METRIC, tags
             ):
+                processor_kwargs = (
+                    {"input_data_format": "channels_last"} if has_tensor else {}
+                )
                 res = processor.image_processor(
-                    image, return_tensors="pt", do_resize=do_resize
+                    image,
+                    return_tensors="pt",
+                    do_resize=do_resize,
+                    **processor_kwargs,
                 )
             return res["pixel_values"], res["image_grid_thw"]
         elif mm_type == MMUrlType.VIDEO:

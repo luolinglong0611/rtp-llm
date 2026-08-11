@@ -228,28 +228,66 @@ def trans_config(mm_process_config_pb: MMPreprocessConfigPB):
 
 
 def trans_mm_input(multimodal_inputs):
+    def is_legacy_url_tensor_placeholder(mm_input) -> bool:
+        tensor_pb = mm_input.multimodal_tensor
+        return (
+            bool(mm_input.multimodal_url)
+            and mm_input.HasField("multimodal_tensor")
+            and tensor_pb.data_type == tensor_pb.DataType.FP32
+            and list(tensor_pb.shape) == [1]
+            and len(tensor_pb.fp32_data) == 4
+            and not tensor_pb.int32_data
+            and not tensor_pb.fp16_data
+            and not tensor_pb.bf16_data
+            and not tensor_pb.uint8_data
+        )
+
+    def validate_source(url: str, tensor: torch.Tensor):
+        if tensor is not None and not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"multimodal tensor must be a torch.Tensor, got {type(tensor)}"
+            )
+        has_url = bool(url)
+        has_tensor = tensor is not None and tensor.numel() > 0
+        if has_url == has_tensor:
+            raise ValueError(
+                "multimodal input must contain exactly one non-empty source: "
+                "url or tensor"
+            )
+
     # vit sep
     if isinstance(multimodal_inputs, MultimodalInputsPB):
-        return [
-            MultimodalInput(
-                mm_input.multimodal_url,
-                MMUrlType(mm_input.multimodal_type),
-                trans_tensor(mm_input.multimodal_tensor),
-                trans_config(mm_input.mm_preprocess_config),
+        converted_inputs = []
+        for mm_input in multimodal_inputs.multimodal_inputs:
+            tensor = (
+                torch.empty(0)
+                if is_legacy_url_tensor_placeholder(mm_input)
+                else trans_tensor(mm_input.multimodal_tensor)
             )
-            for mm_input in multimodal_inputs.multimodal_inputs
-        ]
+            validate_source(mm_input.multimodal_url, tensor)
+            converted_inputs.append(
+                MultimodalInput(
+                    mm_input.multimodal_url,
+                    MMUrlType(mm_input.multimodal_type),
+                    tensor,
+                    trans_config(mm_input.mm_preprocess_config),
+                )
+            )
+        return converted_inputs
     # not sep
     elif isinstance(multimodal_inputs, list):
-        return [
-            MultimodalInput(
-                mm_input.url,
-                MMUrlType(mm_input.mm_type),
-                mm_input.tensor,
-                mm_input.mm_preprocess_config,
+        converted_inputs = []
+        for mm_input in multimodal_inputs:
+            validate_source(mm_input.url, mm_input.tensor)
+            converted_inputs.append(
+                MultimodalInput(
+                    mm_input.url,
+                    MMUrlType(mm_input.mm_type),
+                    mm_input.tensor,
+                    mm_input.mm_preprocess_config,
+                )
             )
-            for mm_input in multimodal_inputs
-        ]
+        return converted_inputs
     else:
         raise ValueError(
             f"Unsupported multimodal input type: {type(multimodal_inputs)}"

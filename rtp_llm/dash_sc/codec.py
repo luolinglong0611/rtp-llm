@@ -32,6 +32,30 @@ if TYPE_CHECKING:
 _INT32_MAX = 2_147_483_647
 _DEFAULT_MAX_NEW_TOKENS = 32000
 
+# Spectrum encodes ``multi_modal_data`` as one Triton BYTES element whose value
+# is a NumPy 1.26 protocol-4 pickle.  The parser below implements only that
+# producer grammar.  It never imports NumPy and never invokes a pickle global.
+_MULTI_MODAL_DATA_INPUT_NAME = "multi_modal_data"
+_MAX_MULTI_MODAL_PIXELS = 23_520_000
+_MAX_MULTI_MODAL_RGB_BYTES = _MAX_MULTI_MODAL_PIXELS * 3
+_MAX_MULTI_MODAL_PICKLE_BYTES = _MAX_MULTI_MODAL_RGB_BYTES + 64 * 1024
+_MAX_MULTI_MODAL_PICKLE_OPCODES = 512
+_MAX_MULTI_MODAL_PICKLE_MEMO_ENTRIES = 64
+_MAX_MULTI_MODAL_PICKLE_STACK = 128
+
+_ALLOWED_MULTI_MODAL_PICKLE_STRINGS = frozenset(
+    {
+        "image",
+        "numpy.core.multiarray",
+        "_reconstruct",
+        "numpy",
+        "ndarray",
+        "dtype",
+        "u1",
+        "|",
+    }
+)
+
 
 class LLMFinishReason(IntEnum):
     """Mirrors dashllm.core.enums.enums.LLMFinishReason values."""
@@ -120,6 +144,404 @@ class DashScParameterError(ValueError):
     """Explicit user-parameter parse/validation error for dash-sc gRPC."""
 
 
+@dataclass(frozen=True)
+class ParsedRGBImage:
+    """Validated RGB pixels backed directly by the Triton request bytes."""
+
+    height: int
+    width: int
+    pixels: memoryview
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.height, self.width, 3)
+
+
+@dataclass(frozen=True)
+class _PickleGlobal:
+    module: str
+    name: str
+
+
+@dataclass(frozen=True)
+class _PickleBytesView:
+    raw: bytes
+    start: int
+    length: int
+
+    def is_exact(self, expected: bytes) -> bool:
+        if self.length != len(expected):
+            return False
+        return self.raw.startswith(expected, self.start, self.start + self.length)
+
+    def memoryview(self) -> memoryview:
+        return memoryview(self.raw)[self.start : self.start + self.length]
+
+
+@dataclass
+class _PickleDType:
+    sealed: bool = False
+
+
+@dataclass
+class _PickleArray:
+    shape: tuple[int, int, int] | None = None
+    pixels: _PickleBytesView | None = None
+    sealed: bool = False
+
+
+_PICKLE_MARK = object()
+_NUMPY_RECONSTRUCT = _PickleGlobal("numpy.core.multiarray", "_reconstruct")
+_NUMPY_NDARRAY = _PickleGlobal("numpy", "ndarray")
+_NUMPY_DTYPE = _PickleGlobal("numpy", "dtype")
+_ALLOWED_PICKLE_GLOBALS = frozenset({_NUMPY_RECONSTRUCT, _NUMPY_NDARRAY, _NUMPY_DTYPE})
+
+
+class _RestrictedNumpyPickleVM:
+    """Non-executing VM for NumPy 1.26's canonical protocol-4 image pickle.
+
+    Large BINBYTES values are represented by offsets into the bytes object
+    returned by protobuf, so the scanner itself does not slice another 70 MB
+    object after protobuf materializes the repeated bytes field.
+    """
+
+    __slots__ = (
+        "raw",
+        "start",
+        "end",
+        "cursor",
+        "frame_end",
+        "stack",
+        "memo",
+        "opcode_count",
+        "proto_count",
+        "array_count",
+        "dtype_count",
+    )
+
+    def __init__(self, raw: bytes, start: int, length: int) -> None:
+        self.raw = raw
+        self.start = start
+        self.end = start + length
+        self.cursor = start
+        self.frame_end: int | None = None
+        self.stack: list[object] = []
+        self.memo: list[object] = []
+        self.opcode_count = 0
+        self.proto_count = 0
+        self.array_count = 0
+        self.dtype_count = 0
+
+    def _fail(self, message: str) -> None:
+        raise DashScParameterError(message)
+
+    def _require(self, size: int) -> int:
+        if size < 0 or self.cursor > self.end - size:
+            self._fail("multi_modal_data pickle is truncated")
+        start = self.cursor
+        self.cursor += size
+        return start
+
+    def _read_u8(self) -> int:
+        return self.raw[self._require(1)]
+
+    def _read_u16(self) -> int:
+        value = struct.unpack_from("<H", self.raw, self._require(2))[0]
+        return int(value)
+
+    def _read_u32(self) -> int:
+        value = struct.unpack_from("<I", self.raw, self._require(4))[0]
+        return int(value)
+
+    def _read_u64(self) -> int:
+        value = struct.unpack_from("<Q", self.raw, self._require(8))[0]
+        return int(value)
+
+    def _read_i32(self) -> int:
+        value = struct.unpack_from("<i", self.raw, self._require(4))[0]
+        return int(value)
+
+    def _push(self, value: object) -> None:
+        self.stack.append(value)
+        if len(self.stack) > _MAX_MULTI_MODAL_PICKLE_STACK:
+            self._fail("multi_modal_data pickle stack is too deep")
+
+    def _pop(self) -> object:
+        if not self.stack:
+            self._fail("multi_modal_data pickle stack underflow")
+        return self.stack.pop()
+
+    def _pop_mark_items(self) -> list[object]:
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index] is _PICKLE_MARK:
+                items = self.stack[index + 1 :]
+                del self.stack[index:]
+                return items
+        self._fail("multi_modal_data pickle MARK is missing")
+
+    def _check_integer(self, value: int) -> int:
+        if abs(value) > _MAX_MULTI_MODAL_PIXELS:
+            self._fail("multi_modal_data pickle integer is out of range")
+        return value
+
+    def _read_unicode(self, length: int) -> str:
+        if length < 0 or length > 255:
+            self._fail("multi_modal_data pickle string is too large")
+        start = self._require(length)
+        try:
+            value = self.raw[start : start + length].decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            self._fail("multi_modal_data pickle string is invalid")
+        if value not in _ALLOWED_MULTI_MODAL_PICKLE_STRINGS:
+            self._fail("multi_modal_data pickle contains an unexpected string")
+        return value
+
+    def _read_bytes_view(self, length: int) -> _PickleBytesView:
+        if length < 0 or length > _MAX_MULTI_MODAL_RGB_BYTES:
+            self._fail("multi_modal_data pickle byte field is too large")
+        start = self._require(length)
+        return _PickleBytesView(self.raw, start, length)
+
+    def _check_frame_boundary(self) -> None:
+        if self.frame_end is None:
+            return
+        if self.cursor > self.frame_end:
+            self._fail("multi_modal_data pickle opcode crosses a frame boundary")
+        if self.cursor == self.frame_end:
+            self.frame_end = None
+
+    def _reduce(self, callable_obj: object, args: object) -> object:
+        if type(args) is not tuple:
+            self._fail("multi_modal_data pickle REDUCE args must be a tuple")
+        if callable_obj == _NUMPY_RECONSTRUCT:
+            if (
+                len(args) != 3
+                or args[0] != _NUMPY_NDARRAY
+                or type(args[1]) is not tuple
+                or args[1] != (0,)
+                or type(args[2]) is not _PickleBytesView
+                or not args[2].is_exact(b"b")
+            ):
+                self._fail("invalid multi_modal_data ndarray reconstruction")
+            self.array_count += 1
+            if self.array_count != 1:
+                self._fail("multi_modal_data must contain exactly one image")
+            return _PickleArray()
+        if callable_obj == _NUMPY_DTYPE:
+            if (
+                len(args) != 3
+                or args[0] != "u1"
+                or type(args[1]) is not bool
+                or args[1] is not False
+                or type(args[2]) is not bool
+                or args[2] is not True
+            ):
+                self._fail("multi_modal_data dtype must be uint8")
+            self.dtype_count += 1
+            if self.dtype_count != 1:
+                self._fail("multi_modal_data contains unexpected dtype objects")
+            return _PickleDType()
+        self._fail("multi_modal_data pickle REDUCE target is forbidden")
+
+    def _build(self, instance: object, state: object) -> None:
+        if type(instance) is _PickleDType:
+            valid_state = (
+                type(state) is tuple
+                and len(state) == 8
+                and type(state[0]) is int
+                and state[0] == 3
+                and state[1:] == ("|", None, None, None, -1, -1, 0)
+                and all(type(state[index]) is int for index in (5, 6, 7))
+            )
+            if instance.sealed or not valid_state:
+                self._fail("multi_modal_data dtype must be uint8")
+            instance.sealed = True
+            return
+        if type(instance) is not _PickleArray:
+            self._fail("multi_modal_data pickle BUILD target is forbidden")
+        if instance.sealed or type(state) is not tuple or len(state) != 5:
+            self._fail("invalid multi_modal_data ndarray state")
+        version, shape, dtype, is_fortran, pixels = state
+        if type(version) is not int or version != 1:
+            self._fail("invalid multi_modal_data ndarray version")
+        if (
+            type(shape) is not tuple
+            or len(shape) != 3
+            or not all(type(dim) is int for dim in shape)
+        ):
+            self._fail("multi_modal_data image must have HWC shape")
+        height, width, channels = shape
+        if channels != 3:
+            self._fail("multi_modal_data image must have three RGB channels")
+        if (
+            height <= 0
+            or width <= 0
+            or height > _MAX_MULTI_MODAL_PIXELS
+            or width > _MAX_MULTI_MODAL_PIXELS
+            or height > _MAX_MULTI_MODAL_PIXELS // width
+        ):
+            self._fail("multi_modal_data image dimensions are out of range")
+        if type(dtype) is not _PickleDType or not dtype.sealed:
+            self._fail("multi_modal_data image dtype is invalid")
+        if is_fortran is not False:
+            self._fail("multi_modal_data image must be C-contiguous")
+        if type(pixels) is not _PickleBytesView:
+            self._fail("multi_modal_data image pixels must be raw bytes")
+        expected_size = height * width * channels
+        if expected_size > _MAX_MULTI_MODAL_RGB_BYTES:
+            self._fail("multi_modal_data RGB payload is too large")
+        if pixels.length != expected_size:
+            self._fail("multi_modal_data RGB byte length does not match image shape")
+        instance.shape = (height, width, channels)
+        instance.pixels = pixels
+        instance.sealed = True
+
+    def parse(self) -> ParsedRGBImage:
+        if self.start < 0 or self.start >= self.end or self.end > len(self.raw):
+            self._fail("multi_modal_data pickle size is invalid")
+        if self.end - self.start > _MAX_MULTI_MODAL_PICKLE_BYTES:
+            self._fail("multi_modal_data pickle is too large")
+
+        while self.cursor < self.end:
+            if self.frame_end is not None and self.cursor == self.frame_end:
+                self.frame_end = None
+            elif self.frame_end is not None and self.cursor > self.frame_end:
+                self._fail("multi_modal_data pickle frame is invalid")
+
+            opcode_position = self.cursor
+            opcode = self._read_u8()
+            self.opcode_count += 1
+            if self.opcode_count > _MAX_MULTI_MODAL_PICKLE_OPCODES:
+                self._fail("multi_modal_data pickle has too many operations")
+
+            if opcode == 0x80:  # PROTO
+                protocol = self._read_u8()
+                self.proto_count += 1
+                if (
+                    opcode_position != self.start
+                    or self.proto_count != 1
+                    or protocol != 4
+                ):
+                    self._fail("multi_modal_data must use pickle protocol 4")
+            elif opcode == 0x95:  # FRAME
+                if self.frame_end is not None:
+                    self._fail("multi_modal_data pickle contains a nested frame")
+                frame_length = self._read_u64()
+                if frame_length > self.end - self.cursor:
+                    self._fail("multi_modal_data pickle frame is invalid")
+                self.frame_end = self.cursor + frame_length
+            elif opcode == 0x7D:  # EMPTY_DICT
+                self._push({})
+            elif opcode == 0x5D:  # EMPTY_LIST
+                self._push([])
+            elif opcode == 0x28:  # MARK
+                self._push(_PICKLE_MARK)
+            elif opcode == 0x8C:  # SHORT_BINUNICODE
+                self._push(self._read_unicode(self._read_u8()))
+            elif opcode == 0x94:  # MEMOIZE
+                if not self.stack:
+                    self._fail("multi_modal_data pickle MEMOIZE stack is empty")
+                if len(self.memo) >= _MAX_MULTI_MODAL_PICKLE_MEMO_ENTRIES:
+                    self._fail("multi_modal_data pickle memo is too large")
+                self.memo.append(self.stack[-1])
+            elif opcode == 0x68:  # BINGET
+                index = self._read_u8()
+                if index >= len(self.memo):
+                    self._fail("multi_modal_data pickle memo reference is invalid")
+                self._push(self.memo[index])
+            elif opcode == 0x4A:  # BININT
+                self._push(self._check_integer(self._read_i32()))
+            elif opcode == 0x4B:  # BININT1
+                self._push(self._check_integer(self._read_u8()))
+            elif opcode == 0x4D:  # BININT2
+                self._push(self._check_integer(self._read_u16()))
+            elif opcode == 0x4E:  # NONE
+                self._push(None)
+            elif opcode == 0x89:  # NEWFALSE
+                self._push(False)
+            elif opcode == 0x88:  # NEWTRUE
+                self._push(True)
+            elif opcode == 0x43:  # SHORT_BINBYTES
+                self._push(self._read_bytes_view(self._read_u8()))
+            elif opcode == 0x42:  # BINBYTES
+                self._push(self._read_bytes_view(self._read_u32()))
+            elif opcode == 0x74:  # TUPLE
+                self._push(tuple(self._pop_mark_items()))
+            elif opcode in (0x85, 0x86, 0x87):  # TUPLE1/2/3
+                count = opcode - 0x84
+                if len(self.stack) < count:
+                    self._fail("multi_modal_data pickle tuple stack underflow")
+                items = self.stack[-count:]
+                del self.stack[-count:]
+                self._push(tuple(items))
+            elif opcode == 0x93:  # STACK_GLOBAL
+                name = self._pop()
+                module = self._pop()
+                if type(module) is not str or type(name) is not str:
+                    self._fail("multi_modal_data pickle global is invalid")
+                global_obj = _PickleGlobal(module, name)
+                if global_obj not in _ALLOWED_PICKLE_GLOBALS:
+                    self._fail("multi_modal_data pickle global is forbidden")
+                self._push(global_obj)
+            elif opcode == 0x52:  # REDUCE
+                args = self._pop()
+                callable_obj = self._pop()
+                self._push(self._reduce(callable_obj, args))
+            elif opcode == 0x62:  # BUILD
+                state = self._pop()
+                if not self.stack:
+                    self._fail("multi_modal_data pickle BUILD stack is empty")
+                self._build(self.stack[-1], state)
+            elif opcode == 0x61:  # APPEND
+                value = self._pop()
+                if not self.stack or type(self.stack[-1]) is not list:
+                    self._fail("multi_modal_data pickle APPEND target is invalid")
+                self.stack[-1].append(value)
+            elif opcode == 0x73:  # SETITEM
+                value = self._pop()
+                key = self._pop()
+                if not self.stack or type(self.stack[-1]) is not dict:
+                    self._fail("multi_modal_data pickle SETITEM target is invalid")
+                if type(key) is not str or key != "image" or key in self.stack[-1]:
+                    self._fail("multi_modal_data pickle root key is invalid")
+                self.stack[-1][key] = value
+            elif opcode == 0x2E:  # STOP
+                if self.proto_count != 1 or self.cursor != self.end:
+                    self._fail("multi_modal_data pickle has trailing or missing data")
+                if self.frame_end is not None and self.cursor != self.frame_end:
+                    self._fail("multi_modal_data pickle frame is invalid")
+                if len(self.stack) != 1:
+                    self._fail("multi_modal_data pickle stack is invalid")
+                return self._validate_root(self.stack[0])
+            else:
+                self._fail(
+                    f"multi_modal_data pickle opcode 0x{opcode:02x} is forbidden"
+                )
+
+            self._check_frame_boundary()
+
+        self._fail("multi_modal_data pickle STOP is missing")
+
+    def _validate_root(self, root: object) -> ParsedRGBImage:
+        if type(root) is not dict or list(root.keys()) != ["image"]:
+            self._fail("multi_modal_data root must contain only image")
+        images = root["image"]
+        if type(images) is not list or len(images) != 1:
+            self._fail("multi_modal_data must contain exactly one image")
+        image = images[0]
+        if (
+            type(image) is not _PickleArray
+            or not image.sealed
+            or image.shape is None
+            or image.pixels is None
+            or self.array_count != 1
+            or self.dtype_count != 1
+        ):
+            self._fail("multi_modal_data image must be an RGB uint8 ndarray")
+        height, width, _ = image.shape
+        return ParsedRGBImage(height, width, image.pixels.memoryview())
+
+
 # ----------------------------------------------------------------------------
 # Low-level tensor decoding helpers (shared by request parsing and access log)
 # ----------------------------------------------------------------------------
@@ -155,6 +577,66 @@ def _find_input_raw(request, tensor_name: str):
             return inp, None
         return inp, request.raw_input_contents[i]
     return None, None
+
+
+def request_has_multi_modal_data(
+    request: predict_v2_pb2.ModelInferRequest,
+) -> bool:
+    """Cheap feature-gate check that does not inspect or copy the image payload."""
+    return any(inp.name == _MULTI_MODAL_DATA_INPUT_NAME for inp in request.inputs)
+
+
+def parse_multi_modal_data_from_request(
+    request: predict_v2_pb2.ModelInferRequest,
+) -> list[ParsedRGBImage]:
+    """Validate Spectrum's protocol-4 NumPy image without executing pickle.
+
+    The Triton BYTES element is ``uint32_le(length) + pickle`` and must be
+    exactly ``{"image": [RGB uint8 HWC ndarray]}``.  Returned pixels are a
+    ``memoryview`` into the protobuf bytes value; after protobuf returns that
+    value, neither the BYTES envelope nor the ndarray BINBYTES field is sliced
+    into another large ``bytes`` object.
+    """
+    matches = [
+        (index, inp)
+        for index, inp in enumerate(request.inputs)
+        if inp.name == _MULTI_MODAL_DATA_INPUT_NAME
+    ]
+    if not matches:
+        return []
+    if len(matches) != 1:
+        raise DashScParameterError("duplicate multi_modal_data inputs")
+    if len(request.raw_input_contents) != len(request.inputs):
+        raise DashScParameterError(
+            "multi_modal_data requires aligned raw_input_contents"
+        )
+
+    index, inp = matches[0]
+    if inp.datatype != "BYTES":
+        raise DashScParameterError("multi_modal_data datatype must be BYTES")
+    shape = list(inp.shape)
+    if not shape or any(dim != 1 for dim in shape):
+        raise DashScParameterError(
+            "multi_modal_data must contain exactly one BYTES element"
+        )
+    if inp.contents.ByteSize() != 0:
+        raise DashScParameterError(
+            "multi_modal_data cannot mix contents with raw_input_contents"
+        )
+
+    raw = request.raw_input_contents[index]
+    if len(raw) < 4:
+        raise DashScParameterError("multi_modal_data BYTES prefix is missing")
+    declared_size = struct.unpack_from("<I", raw, 0)[0]
+    if declared_size == 0 or declared_size != len(raw) - 4:
+        raise DashScParameterError(
+            "multi_modal_data BYTES length prefix does not match payload"
+        )
+    if declared_size > _MAX_MULTI_MODAL_PICKLE_BYTES:
+        raise DashScParameterError("multi_modal_data pickle is too large")
+
+    image = _RestrictedNumpyPickleVM(raw, 4, declared_size).parse()
+    return [image]
 
 
 def _parse_int_tensor_flat(inp, raw: bytes | None) -> list[int] | None:

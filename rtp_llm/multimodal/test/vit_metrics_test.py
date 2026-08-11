@@ -2,29 +2,85 @@ from types import SimpleNamespace
 from unittest import TestCase, main
 from unittest.mock import MagicMock, patch
 
+import grpc
+
 from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
+    MultimodalInputsPB,
     MultimodalOutputPB,
     TensorPB,
 )
 from rtp_llm.metrics.kmonitor_metric_reporter import GaugeMetrics
+from rtp_llm.multimodal.mm_scheduler import MMSchedulerRequestTooLargeError
 from rtp_llm.multimodal.vit_metrics import (
     collect_vit_preprocess_metrics,
     record_vit_preprocess_value,
     video_resized_pixel_count,
     vit_preprocess_timer,
 )
-from rtp_llm.server.vit_rpc_server import _report_output_metrics, _tensor_pb_bytes
+from rtp_llm.server.vit_rpc_server import (
+    MultimodalRpcServer,
+    _report_output_metrics,
+    _tensor_pb_bytes,
+)
+
+
+class _AbortError(RuntimeError):
+    pass
+
+
+class _AbortContext:
+    def __init__(self):
+        self.code = None
+        self.details = None
+
+    def abort(self, code, details):
+        self.code = code
+        self.details = details
+        raise _AbortError(details)
 
 
 class VitMetricsTest(TestCase):
+    def _assert_rpc_error(self, exception, expected_reason):
+        engine = MagicMock()
+        engine.mm_embedding_rpc.side_effect = exception
+        context = _AbortContext()
+
+        with patch("rtp_llm.server.vit_rpc_server.kmonitor.report") as report:
+            with self.assertRaisesRegex(_AbortError, str(exception)):
+                MultimodalRpcServer(engine).RemoteMultimodalEmbedding(
+                    MultimodalInputsPB(), context
+                )
+
+        self.assertEqual(context.code, grpc.StatusCode.INVALID_ARGUMENT)
+        self.assertEqual(context.details, str(exception))
+        reasons = [
+            call.args[2].get("reason")
+            for call in report.call_args_list
+            if len(call.args) >= 3 and isinstance(call.args[2], dict)
+        ]
+        self.assertIn(expected_reason, reasons)
+        return reasons
+
+    def test_rpc_maps_python_validation_errors_to_invalid_argument(self):
+        for exception in (ValueError("bad value"), TypeError("bad type")):
+            with self.subTest(exception_type=type(exception).__name__):
+                self._assert_rpc_error(exception, "invalid_argument")
+
+    def test_rpc_preserves_scheduler_request_too_large_branch_order(self):
+        reasons = self._assert_rpc_error(
+            MMSchedulerRequestTooLargeError("too many images"), "request_too_large"
+        )
+        self.assertNotIn("invalid_argument", reasons)
+
     def test_tensor_pb_bytes_counts_data_fields(self):
         tensor = TensorPB(
             fp32_data=b"1234",
             int32_data=b"12",
             fp16_data=b"1",
             bf16_data=b"",
+            uint8_data=b"123",
         )
-        self.assertEqual(_tensor_pb_bytes(tensor), 7)
+        self.assertEqual(_tensor_pb_bytes(tensor), 10)
 
     def test_multimodal_output_bytes_and_split_size_are_available(self):
         output = MultimodalOutputPB(

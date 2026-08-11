@@ -1,5 +1,6 @@
 #include <memory>
 #include "gtest/gtest.h"
+#include "rtp_llm/cpp/multimodal_processor/LocalMultimodalProcessor.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include "rtp_llm/cpp/multimodal_processor/test/FakeMultimodalProcessor.h"
 
@@ -8,6 +9,38 @@ using namespace std;
 namespace rtp_llm {
 
 class MultimodalProcessorTest: public DeviceTestBase {};
+
+TEST_F(MultimodalProcessorTest, testLocalPythonValidationErrorsAreWrongFormat) {
+    // This cc_test uses the plain gtest main and does not otherwise initialize
+    // CPython. Keep the interpreter alive for the rest of the test process;
+    // later legacy tests also construct pybind objects.
+    if (!Py_IsInitialized()) {
+        Py_Initialize();
+    }
+    py::gil_scoped_acquire acquire;
+    for (bool value_error : {true, false}) {
+        py::object engine               = py::module_::import("types").attr("SimpleNamespace")();
+        engine.attr("mm_embedding_cpp") = py::cpp_function([value_error](py::args) {
+            if (value_error) {
+                throw py::value_error("bad multimodal value");
+            }
+            throw py::type_error("bad multimodal type");
+        });
+
+        MMModelConfig config;
+        config.is_multimodal = true;
+        config.mm_sep_tokens = {{1}};
+        LocalMultimodalProcessor processor(engine, config, 128);
+
+        auto input               = std::make_shared<GenerateInput>();
+        input->input_ids         = torch::tensor({1}, torch::kInt32);
+        input->multimodal_inputs = {MultimodalInput("memory://image")};
+        auto result              = processor.updateMultimodalFeatures(input);
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_EQ(result.code(), ErrorCode::MM_WRONG_FORMAT_ERROR);
+    }
+}
 
 TEST_F(MultimodalProcessorTest, testSimple) {
     FakeMultimodalProcessor        processor = FakeMultimodalProcessor::createFakeMultimodalProcessor({{1}}, false, 10);

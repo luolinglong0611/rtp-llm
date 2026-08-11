@@ -3,22 +3,32 @@
 from __future__ import annotations
 
 import json
+import os
+import pickle
 import struct
+import tempfile
 from unittest import TestCase, main
+from unittest.mock import patch
 
+import numpy as np
 import torch
 
 from rtp_llm.dash_sc.client import build_model_infer_request
 from rtp_llm.dash_sc.codec import (
+    _MAX_MULTI_MODAL_PIXELS,
+    _MAX_MULTI_MODAL_RGB_BYTES,
     DashErrorSpec,
     DashScParameterError,
     DashScRequestControls,
     LLMFinishReason,
+    ParsedRGBImage,
     SamplingParams,
+    _RestrictedNumpyPickleVM,
     build_dash_error_response,
     build_stream_response_from_generate_outputs,
     parse_dash_sc_grpc_request,
     parse_input_ids_from_request,
+    parse_multi_modal_data_from_request,
     parse_request_controls,
     parse_sampling_params,
     prepend_to_generated_ids_tensor,
@@ -110,6 +120,221 @@ def _add_tensor(
     inp.datatype = datatype
     inp.shape[:] = shape
     req.raw_input_contents.append(raw)
+
+
+def _multi_modal_request(
+    payload: bytes,
+    *,
+    datatype: str = "BYTES",
+    shape: list[int] | None = None,
+    declared_size: int | None = None,
+) -> predict_v2_pb2.ModelInferRequest:
+    req = predict_v2_pb2.ModelInferRequest()
+    size = len(payload) if declared_size is None else declared_size
+    _add_tensor(
+        req,
+        "multi_modal_data",
+        datatype,
+        [1] if shape is None else shape,
+        struct.pack("<I", size) + payload,
+    )
+    return req
+
+
+def _pickled_rgb(array: np.ndarray, *, protocol: int = 4) -> bytes:
+    return pickle.dumps({"image": [array]}, protocol=protocol)
+
+
+class _EvilPickle:
+    def __init__(self, marker_path: str) -> None:
+        self.marker_path = marker_path
+
+    def __reduce__(self):
+        return os.system, (f"touch {self.marker_path}",)
+
+
+class _DirectNdarrayReduce:
+    def __reduce__(self):
+        return np.ndarray, ((2, 2, 3),)
+
+
+class _InvalidReconstructReduce:
+    def __reduce__(self):
+        return np.core.multiarray._reconstruct, (np.ndarray, (2,), b"b")
+
+
+class MultiModalDataCodecTest(TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        if not np.__version__.startswith("1.26."):
+            raise AssertionError(
+                f"wire fixture requires production NumPy 1.26, got {np.__version__}"
+            )
+
+    def test_missing_multi_modal_data_is_text_request(self) -> None:
+        self.assertEqual(
+            parse_multi_modal_data_from_request(predict_v2_pb2.ModelInferRequest()),
+            [],
+        )
+
+    def test_real_numpy_126_protocol4_fixture_is_request_backed_rgb(self) -> None:
+        image = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+        payload = _pickled_rgb(image)
+        raw = struct.pack("<I", len(payload)) + payload
+        request = _multi_modal_request(payload)
+
+        parsed = parse_multi_modal_data_from_request(request)
+
+        self.assertEqual(len(parsed), 1)
+        self.assertIsInstance(parsed[0], ParsedRGBImage)
+        self.assertEqual(parsed[0].shape, (4, 5, 3))
+        self.assertEqual(parsed[0].pixels.tobytes(), image.tobytes())
+        # Exercise the scanner directly to make the no-copy ownership
+        # invariant observable without depending on protobuf accessor caching.
+        direct = _RestrictedNumpyPickleVM(raw, 4, len(payload)).parse()
+        self.assertIs(direct.pixels.obj, raw)
+
+    def test_real_numpy_126_large_binbytes_crosses_frames_without_copy(self) -> None:
+        # 76,800 RGB bytes forces protocol-4 BINBYTES and frame transitions;
+        # this is the same opcode path used by multi-megapixel OCR requests.
+        image = np.arange(160 * 160 * 3, dtype=np.uint8).reshape(160, 160, 3)
+        payload = _pickled_rgb(image)
+        self.assertIn(b"\x42\x00,\x01\x00", payload)  # BINBYTES + uint32(76800)
+        raw = struct.pack("<I", len(payload)) + payload
+
+        parsed = _RestrictedNumpyPickleVM(raw, 4, len(payload)).parse()
+
+        self.assertEqual(parsed.shape, (160, 160, 3))
+        self.assertEqual(parsed.pixels.tobytes(), image.tobytes())
+        self.assertIs(parsed.pixels.obj, raw)
+
+    def test_accepts_single_element_multidimensional_tensor_shape(self) -> None:
+        payload = _pickled_rgb(np.zeros((2, 3, 3), dtype=np.uint8))
+        self.assertEqual(
+            len(
+                parse_multi_modal_data_from_request(
+                    _multi_modal_request(payload, shape=[1, 1])
+                )
+            ),
+            1,
+        )
+
+    def test_ocr_capacity_constants_match_producer_limit(self) -> None:
+        self.assertEqual(_MAX_MULTI_MODAL_PIXELS, 23_520_000)
+        self.assertEqual(_MAX_MULTI_MODAL_RGB_BYTES, 70_560_000)
+
+    def test_rejects_bad_triton_bytes_envelope(self) -> None:
+        payload = _pickled_rgb(np.zeros((2, 2, 3), dtype=np.uint8))
+        cases = {
+            "wrong datatype": _multi_modal_request(payload, datatype="UINT8"),
+            "not one element": _multi_modal_request(payload, shape=[2]),
+            "scalar shape": _multi_modal_request(payload, shape=[]),
+            "declared too short": _multi_modal_request(
+                payload, declared_size=len(payload) - 1
+            ),
+            "declared too long": _multi_modal_request(
+                payload, declared_size=len(payload) + 1
+            ),
+        }
+        for name, request in cases.items():
+            with self.subTest(name=name), self.assertRaises(DashScParameterError):
+                parse_multi_modal_data_from_request(request)
+
+        missing_prefix = predict_v2_pb2.ModelInferRequest()
+        _add_tensor(missing_prefix, "multi_modal_data", "BYTES", [1], b"abc")
+        with self.assertRaises(DashScParameterError):
+            parse_multi_modal_data_from_request(missing_prefix)
+
+        mixed_contents = _multi_modal_request(payload)
+        mixed_contents.inputs[0].contents.bytes_contents.append(b"duplicate")
+        with self.assertRaises(DashScParameterError):
+            parse_multi_modal_data_from_request(mixed_contents)
+
+    def test_rejects_duplicate_or_misaligned_inputs(self) -> None:
+        payload = _pickled_rgb(np.zeros((2, 2, 3), dtype=np.uint8))
+        duplicate = _multi_modal_request(payload)
+        _add_tensor(
+            duplicate,
+            "multi_modal_data",
+            "BYTES",
+            [1],
+            struct.pack("<I", len(payload)) + payload,
+        )
+        with self.assertRaises(DashScParameterError):
+            parse_multi_modal_data_from_request(duplicate)
+
+        misaligned = _multi_modal_request(payload)
+        extra = misaligned.inputs.add()
+        extra.name = "max_new_tokens"
+        extra.datatype = "INT32"
+        extra.shape.append(1)
+        with self.assertRaises(DashScParameterError):
+            parse_multi_modal_data_from_request(misaligned)
+
+    def test_rejects_noncanonical_pickle_or_schema(self) -> None:
+        rgb = np.zeros((2, 2, 3), dtype=np.uint8)
+        cases = {
+            "protocol 3": _pickled_rgb(rgb, protocol=3),
+            "protocol 5": _pickled_rgb(rgb, protocol=5),
+            "trailing bytes": _pickled_rgb(rgb) + b"trailing",
+            "wrong root key": pickle.dumps({"images": [rgb]}, protocol=4),
+            "two images": pickle.dumps({"image": [rgb, rgb]}, protocol=4),
+            "image tuple": pickle.dumps({"image": (rgb,)}, protocol=4),
+        }
+        for name, payload in cases.items():
+            with self.subTest(name=name), self.assertRaises(DashScParameterError):
+                parse_multi_modal_data_from_request(_multi_modal_request(payload))
+
+    def test_rejects_non_rgb_uint8_c_contiguous_arrays(self) -> None:
+        cases = {
+            "float32": np.zeros((2, 2, 3), dtype=np.float32),
+            "object dtype": np.zeros((2, 2, 3), dtype=object),
+            "grayscale": np.zeros((2, 2), dtype=np.uint8),
+            "rgba": np.zeros((2, 2, 4), dtype=np.uint8),
+            "empty height": np.zeros((0, 2, 3), dtype=np.uint8),
+            "fortran order": np.asfortranarray(np.zeros((2, 2, 3), dtype=np.uint8)),
+        }
+        for name, image in cases.items():
+            with self.subTest(name=name), self.assertRaises(DashScParameterError):
+                parse_multi_modal_data_from_request(
+                    _multi_modal_request(_pickled_rgb(image))
+                )
+
+    def test_pixel_budget_accepts_boundary_and_rejects_one_over(self) -> None:
+        boundary = _multi_modal_request(
+            _pickled_rgb(np.zeros((2, 2, 3), dtype=np.uint8))
+        )
+        over = _multi_modal_request(_pickled_rgb(np.zeros((2, 3, 3), dtype=np.uint8)))
+        with (
+            patch("rtp_llm.dash_sc.codec._MAX_MULTI_MODAL_PIXELS", 4),
+            patch("rtp_llm.dash_sc.codec._MAX_MULTI_MODAL_RGB_BYTES", 12),
+        ):
+            self.assertEqual(len(parse_multi_modal_data_from_request(boundary)), 1)
+            with self.assertRaises(DashScParameterError):
+                parse_multi_modal_data_from_request(over)
+
+    def test_corrupt_frame_is_a_controlled_parameter_error(self) -> None:
+        payload = bytearray(_pickled_rgb(np.zeros((2, 2, 3), dtype=np.uint8)))
+        self.assertEqual(payload[2], 0x95)
+        payload[3:11] = struct.pack("<Q", len(payload) + 100)
+        with self.assertRaises(DashScParameterError):
+            parse_multi_modal_data_from_request(_multi_modal_request(bytes(payload)))
+
+    def test_nonexecuting_scanner_blocks_rce_without_side_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = os.path.join(temp_dir, "pickle-rce-marker")
+            payload = pickle.dumps({"image": [_EvilPickle(marker)]}, protocol=4)
+            with self.assertRaises(DashScParameterError):
+                parse_multi_modal_data_from_request(_multi_modal_request(payload))
+            self.assertFalse(os.path.exists(marker))
+
+    def test_nonexecuting_scanner_never_exposes_numpy_allocators(self) -> None:
+        for value in (_DirectNdarrayReduce(), _InvalidReconstructReduce()):
+            with self.subTest(value=type(value).__name__):
+                payload = pickle.dumps({"image": [value]}, protocol=4)
+                with self.assertRaises(DashScParameterError):
+                    parse_multi_modal_data_from_request(_multi_modal_request(payload))
 
 
 class DashScGrpcRequestTest(TestCase):

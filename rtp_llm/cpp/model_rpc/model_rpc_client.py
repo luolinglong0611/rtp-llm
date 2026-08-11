@@ -4,6 +4,7 @@ import logging
 from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 import grpc
+import torch
 from google.protobuf.wrappers_pb2 import StringValue
 from grpc import StatusCode
 
@@ -16,7 +17,6 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
     GenerateConfigPB,
     GenerateInputPB,
     GenerateOutputsPB,
-    MultimodalInputPB,
     RoleAddrPB,
 )
 from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc import RpcServiceStub
@@ -286,8 +286,25 @@ def trans_multimodal_input(
         else:
             resized_shape = generate_config.resized_shape
     for mm_input in input_py.mm_inputs:
-        mm_input_pb = MultimodalInputPB()
-        mm_input_pb.multimodal_url = mm_input.url
+        tensor = mm_input.tensor
+        if tensor is not None and not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"multimodal tensor must be a torch.Tensor, got {type(tensor)}"
+            )
+        has_url = bool(mm_input.url)
+        has_tensor = tensor is not None and tensor.numel() > 0
+        if has_url == has_tensor:
+            raise ValueError(
+                "multimodal input must contain exactly one non-empty source: "
+                "url or tensor"
+            )
+        # Build directly in the repeated field so a large UINT8 payload is not
+        # copied again by appending a temporary protobuf message.
+        mm_input_pb = input_pb.multimodal_inputs.add()
+        if has_url:
+            mm_input_pb.multimodal_url = mm_input.url
+        else:
+            trans_from_tensor(tensor, mm_input_pb.multimodal_tensor)
         mm_input_pb.multimodal_type = mm_input.mm_type
         mm_preprocess_config_pb = mm_input_pb.mm_preprocess_config
         mm_preprocess_config_pb.width = get_multimodal_preprocess_value(
@@ -319,7 +336,6 @@ def trans_multimodal_input(
         mm_preprocess_config_pb.mm_timeout_ms = get_multimodal_preprocess_value(
             generate_config.mm_timeout_ms, mm_input.mm_preprocess_config.mm_timeout_ms
         )
-        input_pb.multimodal_inputs.append(mm_input_pb)
 
 
 # 假设 trans_tensor 函数将 Protobuf 的 TensorPB 转换为 numpy array

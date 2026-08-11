@@ -48,6 +48,7 @@ def _tensor_pb_bytes(tensor_pb) -> int:
         + len(tensor_pb.int32_data)
         + len(tensor_pb.fp16_data)
         + len(tensor_pb.bf16_data)
+        + len(tensor_pb.uint8_data)
     )
 
 
@@ -170,6 +171,16 @@ class MultimodalRpcServer(MultimodalRpcServiceServicer):
                 AccMetrics.VIT_RPC_SERVER_ERROR_QPS_METRIC,
                 1,
                 {"source": "vit_server", "reason": "request_too_large"},
+            )
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+        except (ValueError, TypeError) as e:
+            # Validation/decode failures are caller errors. Keep this after the
+            # scheduler-specific branches: MMSchedulerRequestTooLargeError is
+            # also a ValueError and retains its dedicated metric reason above.
+            kmonitor.report(
+                AccMetrics.VIT_RPC_SERVER_ERROR_QPS_METRIC,
+                1,
+                {"source": "vit_server", "reason": "invalid_argument"},
             )
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception:

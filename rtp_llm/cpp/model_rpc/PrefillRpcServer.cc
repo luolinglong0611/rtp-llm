@@ -265,6 +265,11 @@ void PrefillRpcServer::multimodalProcess(PrefillGenerateContext& prefill_context
         for (size_t i = 0; i < input->input_ids.numel(); i++) {
             mutable_request->add_token_ids(ids_ptr[i]);
         }
+        // The prefill multimodal processor has consumed the image and expanded
+        // the prompt token ids. Decode only needs those ids plus the transferred
+        // KV cache; forwarding the original UINT8 image would duplicate up to
+        // 70.56 MB per request without any semantic use on the decode node.
+        mutable_request->clear_multimodal_inputs();
     }
 }
 

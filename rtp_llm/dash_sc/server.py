@@ -68,29 +68,22 @@ _SERVER_KEEPALIVE_OPTS: list[tuple[str, int]] = [
 
 
 class _ShutdownManager(Protocol):
-    def try_begin_request(self) -> bool:
-        ...
+    def try_begin_request(self) -> bool: ...
 
-    def finish_request(self) -> int:
-        ...
+    def finish_request(self) -> int: ...
 
-    def is_unavailable(self) -> bool:
-        ...
+    def is_unavailable(self) -> bool: ...
 
-    def is_draining(self) -> bool:
-        ...
+    def is_draining(self) -> bool: ...
 
-    def drain_reason(self) -> str:
-        ...
+    def drain_reason(self) -> str: ...
 
-    def active_request_count(self) -> int:
-        ...
+    def active_request_count(self) -> int: ...
 
 
 @runtime_checkable
 class _ClosableServicer(Protocol):
-    async def close(self) -> None:
-        ...
+    async def close(self) -> None: ...
 
 
 def _merge_server_keepalive(
@@ -145,6 +138,7 @@ class DashScGrpcServer:
         log_path: str = "",
         backup_count: int = 0,
         rank_id: Optional[int] = None,
+        maximum_concurrent_rpcs: Optional[int] = None,
     ) -> grpc.aio.Server:
         """Bind + start the aio gRPC server. Must be awaited on the owning loop.
 
@@ -210,13 +204,14 @@ class DashScGrpcServer:
         interceptors: list[grpc.aio.ServerInterceptor] = []
         if shutdown_manager is not None:
             interceptors.append(DashScGrpcDrainAioInterceptor(shutdown_manager))
-        # Deliberately no ``maximum_concurrent_rpcs`` — under grpc.aio concurrent
-        # RPCs are coroutines on one loop, not threads, so any positive value
-        # becomes a hard admission cap (RESOURCE_EXHAUSTED once N long streams
-        # are in flight). Backpressure comes from the backend visitor's own
-        # concurrency instead. ``DashScGrpcConfig.max_server_workers`` is
-        # retained on the C++ struct for wire compatibility but ignored here.
-        server = grpc.aio.server(options=opts, interceptors=interceptors)
+        # Normally the backend visitor owns backpressure and this remains None.
+        # Raw-image inference can opt into a small admission cap because each
+        # accepted stream may retain a 70.56 MB request plus transport copies.
+        server = grpc.aio.server(
+            options=opts,
+            interceptors=interceptors,
+            maximum_concurrent_rpcs=maximum_concurrent_rpcs,
+        )
 
         predict_v2_pb2_grpc.add_GRPCInferenceServiceServicer_to_server(servicer, server)
         bind_addr = f"0.0.0.0:{port}"
@@ -244,6 +239,7 @@ class DashScGrpcServer:
         log_path: str = "",
         backup_count: int = 0,
         rank_id: Optional[int] = None,
+        maximum_concurrent_rpcs: Optional[int] = None,
         startup_timeout_s: float = _DEFAULT_DASH_SC_GRPC_STARTUP_TIMEOUT_S,
     ) -> None:
         """Schedule ``start()`` on ``loop`` and block until it returns or raises.
@@ -263,6 +259,7 @@ class DashScGrpcServer:
                 log_path=log_path,
                 backup_count=backup_count,
                 rank_id=rank_id,
+                maximum_concurrent_rpcs=maximum_concurrent_rpcs,
             ),
             loop,
         )
