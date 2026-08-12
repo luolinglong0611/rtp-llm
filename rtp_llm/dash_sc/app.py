@@ -168,7 +168,7 @@ def _resolve_multimodal_tensor_enabled(model_config: ModelConfig) -> bool:
 def _resolve_multimodal_max_concurrent_rpcs(
     multimodal_tensor_enabled: bool,
 ) -> Optional[int]:
-    """Bound request admission while a process may retain 70.56 MB images."""
+    """Bound only image processing while a process may retain 70.56 MB inputs."""
     if not multimodal_tensor_enabled:
         return None
 
@@ -745,7 +745,10 @@ class DashScApp:
                 log_path=get_log_path(),
                 backup_count=self.py_env_configs.profiling_debug_logging_config.log_file_backup_count,
                 rank_id=self.server_config.rank_id,
-                maximum_concurrent_rpcs=multimodal_max_concurrent_rpcs,
+                # The servicer's multimodal semaphore limits only image
+                # requests. A server-wide cap would also throttle pure-text
+                # streams whenever tensor forwarding is enabled.
+                maximum_concurrent_rpcs=None,
             )
             logging.info("[DashScApp] gRPC server bound on port %s", port)
         except BaseException as e:

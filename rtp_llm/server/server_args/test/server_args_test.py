@@ -423,19 +423,25 @@ class ServerArgsSetTest(TestCase):
         self.assertEqual(cfg.tool_call_loop_begin_marker, "<tool_call>")
         self.assertEqual(cfg.tool_call_loop_end_marker, "</tool_call>")
 
-    def test_dash_sc_default_allows_large_requests_on_both_ends(self):
+    def test_grpc_defaults_allow_max_multimodal_requests_on_receivers(self):
         from rtp_llm.server.server_args.grpc_group_args import (
             default_dash_sc_grpc_config_json,
+            default_model_grpc_config_json,
         )
 
-        config = json.loads(default_dash_sc_grpc_config_json())
-        expected = 1024 * 1024 * 1024
+        dash_sc_config = json.loads(default_dash_sc_grpc_config_json())
+        model_config = json.loads(default_model_grpc_config_json())
         self.assertEqual(
-            config["client_config"]["grpc.max_receive_message_length"], expected
+            dash_sc_config["client_config"]["grpc.max_receive_message_length"],
+            1024 * 1024 * 1024,
         )
         self.assertEqual(
-            config["server_config"]["grpc.max_receive_message_length"],
-            64 * 1024 * 1024,
+            dash_sc_config["server_config"]["grpc.max_receive_message_length"],
+            128 * 1024 * 1024,
+        )
+        self.assertEqual(
+            model_config["server_config"]["grpc.max_receive_message_length"],
+            128 * 1024 * 1024,
         )
 
 

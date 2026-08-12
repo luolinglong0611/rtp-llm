@@ -145,6 +145,10 @@ def _pickled_rgb(array: np.ndarray, *, protocol: int = 4) -> bytes:
     return pickle.dumps({"image": [array]}, protocol=protocol)
 
 
+def _pickled_rgb_images(arrays: list[np.ndarray], *, protocol: int = 4) -> bytes:
+    return pickle.dumps({"image": arrays}, protocol=protocol)
+
+
 class _EvilPickle:
     def __init__(self, marker_path: str) -> None:
         self.marker_path = marker_path
@@ -193,7 +197,8 @@ class MultiModalDataCodecTest(TestCase):
         # Exercise the scanner directly to make the no-copy ownership
         # invariant observable without depending on protobuf accessor caching.
         direct = _RestrictedNumpyPickleVM(raw, 4, len(payload)).parse()
-        self.assertIs(direct.pixels.obj, raw)
+        self.assertEqual(len(direct), 1)
+        self.assertIs(direct[0].pixels.obj, raw)
 
     def test_real_numpy_126_large_binbytes_crosses_frames_without_copy(self) -> None:
         # 76,800 RGB bytes forces protocol-4 BINBYTES and frame transitions;
@@ -205,9 +210,48 @@ class MultiModalDataCodecTest(TestCase):
 
         parsed = _RestrictedNumpyPickleVM(raw, 4, len(payload)).parse()
 
-        self.assertEqual(parsed.shape, (160, 160, 3))
-        self.assertEqual(parsed.pixels.tobytes(), image.tobytes())
-        self.assertIs(parsed.pixels.obj, raw)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].shape, (160, 160, 3))
+        self.assertEqual(parsed[0].pixels.tobytes(), image.tobytes())
+        self.assertIs(parsed[0].pixels.obj, raw)
+
+    def test_real_numpy_126_multi_image_fixture_preserves_order(self) -> None:
+        images = [
+            np.full((2, 3, 3), 11, dtype=np.uint8),
+            np.full((4, 5, 3), 22, dtype=np.uint8),
+            np.full((1, 2, 3), 33, dtype=np.uint8),
+        ]
+
+        parsed = parse_multi_modal_data_from_request(
+            _multi_modal_request(_pickled_rgb_images(images))
+        )
+
+        self.assertEqual([image.shape for image in parsed], [x.shape for x in images])
+        self.assertEqual(
+            [image.pixels.tobytes() for image in parsed],
+            [image.tobytes() for image in images],
+        )
+
+    def test_accepts_videommmu_32_frames_plus_question_image(self) -> None:
+        images = [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(33)]
+
+        parsed = parse_multi_modal_data_from_request(
+            _multi_modal_request(_pickled_rgb_images(images))
+        )
+
+        self.assertEqual(len(parsed), 33)
+        self.assertEqual(parsed[0].pixels[0], 0)
+        self.assertEqual(parsed[-1].pixels[0], 32)
+
+    def test_accepts_maximum_image_count(self) -> None:
+        images = [np.full((1, 1, 3), index, dtype=np.uint8) for index in range(64)]
+
+        parsed = parse_multi_modal_data_from_request(
+            _multi_modal_request(_pickled_rgb_images(images))
+        )
+
+        self.assertEqual(len(parsed), 64)
+        self.assertEqual([image.pixels[0] for image in parsed], list(range(64)))
 
     def test_accepts_single_element_multidimensional_tensor_shape(self) -> None:
         payload = _pickled_rgb(np.zeros((2, 3, 3), dtype=np.uint8))
@@ -279,12 +323,19 @@ class MultiModalDataCodecTest(TestCase):
             "protocol 5": _pickled_rgb(rgb, protocol=5),
             "trailing bytes": _pickled_rgb(rgb) + b"trailing",
             "wrong root key": pickle.dumps({"images": [rgb]}, protocol=4),
-            "two images": pickle.dumps({"image": [rgb, rgb]}, protocol=4),
+            "empty image list": pickle.dumps({"image": []}, protocol=4),
             "image tuple": pickle.dumps({"image": (rgb,)}, protocol=4),
         }
         for name, payload in cases.items():
             with self.subTest(name=name), self.assertRaises(DashScParameterError):
                 parse_multi_modal_data_from_request(_multi_modal_request(payload))
+
+    def test_rejects_too_many_images(self) -> None:
+        images = [np.zeros((1, 1, 3), dtype=np.uint8) for _ in range(65)]
+        with self.assertRaisesRegex(DashScParameterError, "too many images"):
+            parse_multi_modal_data_from_request(
+                _multi_modal_request(_pickled_rgb_images(images))
+            )
 
     def test_rejects_non_rgb_uint8_c_contiguous_arrays(self) -> None:
         cases = {
@@ -311,6 +362,31 @@ class MultiModalDataCodecTest(TestCase):
             patch("rtp_llm.dash_sc.codec._MAX_MULTI_MODAL_RGB_BYTES", 12),
         ):
             self.assertEqual(len(parse_multi_modal_data_from_request(boundary)), 1)
+            with self.assertRaises(DashScParameterError):
+                parse_multi_modal_data_from_request(over)
+
+    def test_multi_image_pixel_budget_is_aggregate(self) -> None:
+        boundary = _multi_modal_request(
+            _pickled_rgb_images(
+                [
+                    np.zeros((1, 2, 3), dtype=np.uint8),
+                    np.zeros((1, 2, 3), dtype=np.uint8),
+                ]
+            )
+        )
+        over = _multi_modal_request(
+            _pickled_rgb_images(
+                [
+                    np.zeros((1, 2, 3), dtype=np.uint8),
+                    np.zeros((1, 3, 3), dtype=np.uint8),
+                ]
+            )
+        )
+        with (
+            patch("rtp_llm.dash_sc.codec._MAX_MULTI_MODAL_PIXELS", 4),
+            patch("rtp_llm.dash_sc.codec._MAX_MULTI_MODAL_RGB_BYTES", 12),
+        ):
+            self.assertEqual(len(parse_multi_modal_data_from_request(boundary)), 2)
             with self.assertRaises(DashScParameterError):
                 parse_multi_modal_data_from_request(over)
 

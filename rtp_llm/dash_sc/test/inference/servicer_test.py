@@ -77,7 +77,13 @@ def _unpack_int32_le(raw: bytes) -> list[int]:
 def _add_multimodal_image(
     req: predict_v2_pb2.ModelInferRequest, image: np.ndarray
 ) -> None:
-    payload = pickle.dumps({"image": [image]}, protocol=4)
+    _add_multimodal_images(req, [image])
+
+
+def _add_multimodal_images(
+    req: predict_v2_pb2.ModelInferRequest, images: list[np.ndarray]
+) -> None:
+    payload = pickle.dumps({"image": images}, protocol=4)
     _add_input_tensor(
         req,
         "multi_modal_data",
@@ -1756,6 +1762,39 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         debug_calls = repr(debug.call_args_list)
         self.assertNotIn("data:image", debug_calls)
         self.assertNotIn("tensor([[[", debug_calls)
+
+    async def test_videommmu_frames_preserve_count_order_and_markers(self) -> None:
+        images = [np.full((2, 3, 3), index, dtype=np.uint8) for index in range(33)]
+        input_ids = [7]
+        for index in range(len(images)):
+            input_ids.extend((101, index, 102))
+        input_ids.append(8)
+        request = self._valid_infer_request()
+        request.inputs[0].shape[:] = [len(input_ids)]
+        request.raw_input_contents[0] = struct.pack(f"<{len(input_ids)}i", *input_ids)
+        _add_multimodal_images(request, images)
+        visitor = self._terminal_visitor()
+        servicer = DashScInferenceServicer(
+            backend_visitor=visitor,
+            multimodal_tensor_enabled=True,
+            mm_sep_tokens=[[101, 102]],
+        )
+
+        responses = await _drain(
+            servicer.ModelStreamInfer(_areq_iter([request]), _FakeGrpcContext())
+        )
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(visitor.enqueue_called, 1)
+        mm_inputs = visitor.last_generate_input.mm_inputs
+        self.assertEqual(len(mm_inputs), 33)
+        self.assertTrue(
+            all(tuple(mm_input.tensor.shape) == (2, 3, 3) for mm_input in mm_inputs)
+        )
+        self.assertEqual(
+            [int(mm_input.tensor[0, 0, 0]) for mm_input in mm_inputs],
+            list(range(33)),
+        )
 
     async def test_marker_mismatch_rejected_after_parse_and_releases_slot(
         self,

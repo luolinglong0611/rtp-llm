@@ -310,7 +310,7 @@ class MultimodalTensorAdmissionTest(TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(_resolve_multimodal_max_concurrent_rpcs(False))
 
-    def test_enabled_writer_defaults_to_one_rpc_per_process(self) -> None:
+    def test_enabled_writer_defaults_to_one_image_request_per_process(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_resolve_multimodal_max_concurrent_rpcs(True), 1)
 

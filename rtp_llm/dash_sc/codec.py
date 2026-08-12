@@ -33,15 +33,17 @@ _INT32_MAX = 2_147_483_647
 _DEFAULT_MAX_NEW_TOKENS = 32000
 
 # Spectrum encodes ``multi_modal_data`` as one Triton BYTES element whose value
-# is a NumPy 1.26 protocol-4 pickle.  The parser below implements only that
-# producer grammar.  It never imports NumPy and never invokes a pickle global.
+# is a NumPy 1.26 protocol-4 pickle containing an ordered image list.  The
+# parser below implements only that producer grammar.  It never imports NumPy
+# and never invokes a pickle global.
 _MULTI_MODAL_DATA_INPUT_NAME = "multi_modal_data"
+_MAX_MULTI_MODAL_IMAGES = 64
 _MAX_MULTI_MODAL_PIXELS = 23_520_000
 _MAX_MULTI_MODAL_RGB_BYTES = _MAX_MULTI_MODAL_PIXELS * 3
 _MAX_MULTI_MODAL_PICKLE_BYTES = _MAX_MULTI_MODAL_RGB_BYTES + 64 * 1024
-_MAX_MULTI_MODAL_PICKLE_OPCODES = 512
-_MAX_MULTI_MODAL_PICKLE_MEMO_ENTRIES = 64
-_MAX_MULTI_MODAL_PICKLE_STACK = 128
+_MAX_MULTI_MODAL_PICKLE_OPCODES = 4096
+_MAX_MULTI_MODAL_PICKLE_MEMO_ENTRIES = 1024
+_MAX_MULTI_MODAL_PICKLE_STACK = 256
 
 _ALLOWED_MULTI_MODAL_PICKLE_STRINGS = frozenset(
     {
@@ -198,7 +200,7 @@ _ALLOWED_PICKLE_GLOBALS = frozenset({_NUMPY_RECONSTRUCT, _NUMPY_NDARRAY, _NUMPY_
 
 
 class _RestrictedNumpyPickleVM:
-    """Non-executing VM for NumPy 1.26's canonical protocol-4 image pickle.
+    """Non-executing VM for NumPy 1.26's canonical image-list pickle.
 
     Large BINBYTES values are represented by offsets into the bytes object
     returned by protobuf, so the scanner itself does not slice another 70 MB
@@ -217,6 +219,8 @@ class _RestrictedNumpyPickleVM:
         "proto_count",
         "array_count",
         "dtype_count",
+        "total_pixels",
+        "total_rgb_bytes",
     )
 
     def __init__(self, raw: bytes, start: int, length: int) -> None:
@@ -231,6 +235,8 @@ class _RestrictedNumpyPickleVM:
         self.proto_count = 0
         self.array_count = 0
         self.dtype_count = 0
+        self.total_pixels = 0
+        self.total_rgb_bytes = 0
 
     def _fail(self, message: str) -> None:
         raise DashScParameterError(message)
@@ -324,8 +330,8 @@ class _RestrictedNumpyPickleVM:
             ):
                 self._fail("invalid multi_modal_data ndarray reconstruction")
             self.array_count += 1
-            if self.array_count != 1:
-                self._fail("multi_modal_data must contain exactly one image")
+            if self.array_count > _MAX_MULTI_MODAL_IMAGES:
+                self._fail("multi_modal_data contains too many images")
             return _PickleArray()
         if callable_obj == _NUMPY_DTYPE:
             if (
@@ -392,11 +398,18 @@ class _RestrictedNumpyPickleVM:
             self._fail("multi_modal_data RGB payload is too large")
         if pixels.length != expected_size:
             self._fail("multi_modal_data RGB byte length does not match image shape")
+        image_pixels = height * width
+        if self.total_pixels > _MAX_MULTI_MODAL_PIXELS - image_pixels:
+            self._fail("multi_modal_data images have too many total pixels")
+        if self.total_rgb_bytes > _MAX_MULTI_MODAL_RGB_BYTES - expected_size:
+            self._fail("multi_modal_data total RGB payload is too large")
+        self.total_pixels += image_pixels
+        self.total_rgb_bytes += expected_size
         instance.shape = (height, width, channels)
         instance.pixels = pixels
         instance.sealed = True
 
-    def parse(self) -> ParsedRGBImage:
+    def parse(self) -> list[ParsedRGBImage]:
         if self.start < 0 or self.start >= self.end or self.end > len(self.raw):
             self._fail("multi_modal_data pickle size is invalid")
         if self.end - self.start > _MAX_MULTI_MODAL_PICKLE_BYTES:
@@ -497,6 +510,15 @@ class _RestrictedNumpyPickleVM:
                 if not self.stack or type(self.stack[-1]) is not list:
                     self._fail("multi_modal_data pickle APPEND target is invalid")
                 self.stack[-1].append(value)
+                if len(self.stack[-1]) > _MAX_MULTI_MODAL_IMAGES:
+                    self._fail("multi_modal_data contains too many images")
+            elif opcode == 0x65:  # APPENDS
+                values = self._pop_mark_items()
+                if not self.stack or type(self.stack[-1]) is not list:
+                    self._fail("multi_modal_data pickle APPENDS target is invalid")
+                if len(self.stack[-1]) > _MAX_MULTI_MODAL_IMAGES - len(values):
+                    self._fail("multi_modal_data contains too many images")
+                self.stack[-1].extend(values)
             elif opcode == 0x73:  # SETITEM
                 value = self._pop()
                 key = self._pop()
@@ -522,24 +544,30 @@ class _RestrictedNumpyPickleVM:
 
         self._fail("multi_modal_data pickle STOP is missing")
 
-    def _validate_root(self, root: object) -> ParsedRGBImage:
+    def _validate_root(self, root: object) -> list[ParsedRGBImage]:
         if type(root) is not dict or list(root.keys()) != ["image"]:
             self._fail("multi_modal_data root must contain only image")
         images = root["image"]
-        if type(images) is not list or len(images) != 1:
-            self._fail("multi_modal_data must contain exactly one image")
-        image = images[0]
         if (
-            type(image) is not _PickleArray
-            or not image.sealed
-            or image.shape is None
-            or image.pixels is None
-            or self.array_count != 1
+            type(images) is not list
+            or not images
+            or len(images) > _MAX_MULTI_MODAL_IMAGES
+            or self.array_count != len(images)
             or self.dtype_count != 1
         ):
-            self._fail("multi_modal_data image must be an RGB uint8 ndarray")
-        height, width, _ = image.shape
-        return ParsedRGBImage(height, width, image.pixels.memoryview())
+            self._fail("multi_modal_data must contain one or more RGB images")
+        parsed: list[ParsedRGBImage] = []
+        for image in images:
+            if (
+                type(image) is not _PickleArray
+                or not image.sealed
+                or image.shape is None
+                or image.pixels is None
+            ):
+                self._fail("multi_modal_data image must be an RGB uint8 ndarray")
+            height, width, _ = image.shape
+            parsed.append(ParsedRGBImage(height, width, image.pixels.memoryview()))
+        return parsed
 
 
 # ----------------------------------------------------------------------------
@@ -589,13 +617,14 @@ def request_has_multi_modal_data(
 def parse_multi_modal_data_from_request(
     request: predict_v2_pb2.ModelInferRequest,
 ) -> list[ParsedRGBImage]:
-    """Validate Spectrum's protocol-4 NumPy image without executing pickle.
+    """Validate Spectrum's protocol-4 NumPy image list without executing pickle.
 
     The Triton BYTES element is ``uint32_le(length) + pickle`` and must be
-    exactly ``{"image": [RGB uint8 HWC ndarray]}``.  Returned pixels are a
-    ``memoryview`` into the protobuf bytes value; after protobuf returns that
-    value, neither the BYTES envelope nor the ndarray BINBYTES field is sliced
-    into another large ``bytes`` object.
+    exactly ``{"image": [RGB uint8 HWC ndarray, ...]}`` with 1..64 images.
+    Aggregate pixels and RGB bytes remain subject to the deployment budgets.
+    Returned pixels are ``memoryview`` objects into the protobuf bytes value;
+    neither the BYTES envelope nor ndarray BINBYTES fields are sliced into
+    additional large ``bytes`` objects.
     """
     matches = [
         (index, inp)
@@ -635,8 +664,7 @@ def parse_multi_modal_data_from_request(
     if declared_size > _MAX_MULTI_MODAL_PICKLE_BYTES:
         raise DashScParameterError("multi_modal_data pickle is too large")
 
-    image = _RestrictedNumpyPickleVM(raw, 4, declared_size).parse()
-    return [image]
+    return _RestrictedNumpyPickleVM(raw, 4, declared_size).parse()
 
 
 def _parse_int_tensor_flat(inp, raw: bytes | None) -> list[int] | None:
