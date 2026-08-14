@@ -1,11 +1,12 @@
-// Compat shim for CUDA 13 CUB.
+// Compat shim for CUB 3.x.
 //
-// CCCL shipped with CUDA 13 dropped cub::Max / cub::Min / cub::Sum (and moved
+// CCCL 3.x dropped cub::Max / cub::Min / cub::Sum (and moved
 // cub::CountingInputIterator / cub::TransformInputIterator to thrust::) so any
 // rtp_llm first-party .cu file that still uses those names would fail to
-// compile against CUDA 13.  Include this header AFTER `<cub/cub.cuh>` to pull
-// aliases back into namespace cub for CUDA 13 only — on CUDA 12 the header is
-// a no-op.
+// compile against CUB 3.x.  Include this header AFTER `<cub/cub.cuh>` to pull
+// aliases back into namespace cub for CUB 3.x only.  Gate on the CUB version,
+// not the compiler version: PPU compilers may report CUDA 13 while using the
+// CUDA 12.6 SDK's CUB 2.5, which still provides the original symbols.
 //
 // Intentionally scoped to the symbols we actually reference in rtp_llm
 // first-party code — see the matching call sites in:
@@ -16,7 +17,7 @@
 #ifndef RTP_LLM_3RDPARTY_CUB_COMPAT_H_
 #define RTP_LLM_3RDPARTY_CUB_COMPAT_H_
 
-#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+#if defined(CUB_VERSION) && CUB_VERSION >= 300000
 
 #include <cuda/functional>
 #include <thrust/iterator/counting_iterator.h>
@@ -57,6 +58,6 @@ using TransformInputIterator = ::thrust::transform_iterator<ConversionOp, InputI
 
 }  // namespace cub
 
-#endif  // __CUDACC_VER_MAJOR__ >= 13
+#endif  // CUB_VERSION >= 300000
 
 #endif  // RTP_LLM_3RDPARTY_CUB_COMPAT_H_
