@@ -27,6 +27,7 @@ from rtp_llm.utils.concurrency_controller import (
     set_global_controller,
 )
 from rtp_llm.utils.oom_diag import install_oom_dump
+from rtp_llm.utils.import_util import import_optional_internal_source_entrypoint
 from rtp_llm.utils.process_manager import ProcessManager
 from rtp_llm.utils.util import copy_gemm_config
 
@@ -63,6 +64,9 @@ def local_rank_start(
 ):
     """Start local rank with proper signal handling for graceful shutdown"""
     _install_hot_hook_runtime(f"backend_rank_{world_rank}")
+    # Spawned ranks start with a fresh interpreter, so install optional runtime
+    # extensions again before importing backend implementations.
+    import_optional_internal_source_entrypoint("models_py")
     backend_manager = None
     logging.info(f"[PROCESS_START]Start local rank process")
 

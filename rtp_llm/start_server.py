@@ -8,13 +8,19 @@ import traceback
 import requests
 import torch
 
+from rtp_llm.config.log_config import setup_logging
+from rtp_llm.utils.import_util import import_optional_internal_source_entrypoint
 from rtp_llm.utils.time_util import timer_wrapper
 from rtp_llm.utils.util import str_to_bool
 
 CUR_PATH = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(str(CUR_PATH), ".."))
 
-from rtp_llm.config.log_config import setup_logging
+setup_logging()
+
+# Install optional internal runtime extensions before importing server_args.
+import_optional_internal_source_entrypoint("models_py")
+
 from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.config.server_config_setup import setup_and_configure_server
 from rtp_llm.ops import RoleType, SpeculativeType, VitSeparation
@@ -27,9 +33,6 @@ from rtp_llm.utils.process_manager import (
     ProcessManager,
 )
 from rtp_llm.utils.warmup import configure_warmup
-
-setup_logging()
-
 
 def _install_hot_hook_runtime(role: str) -> None:
     try:
