@@ -100,6 +100,7 @@ class ServerArgsSetTest(TestCase):
         os.environ["MM_VIDEO_MAX_FILE_SIZE_KB"] = "4096"
         os.environ["THINK_MODE"] = "adaptive"
         os.environ["DISABLE_FLASHINFER_HYBRID_PREFILL"] = "1"
+        os.environ["MAX_RPC_TIMEOUT_MS"] = "7200000"
 
         sys.argv = ["prog"]
 
@@ -165,6 +166,11 @@ class ServerArgsSetTest(TestCase):
         )
         self.assertEqual(
             py_env_configs.server_config.dash_sc_grpc_pre_stop_drain_seconds, 9.0
+        )
+
+        # Verify pd_separation_config
+        self.assertEqual(
+            py_env_configs.pd_separation_config.max_rpc_timeout_ms, 7200000
         )
 
         # Verify runtime_config (warm_up is now in RuntimeConfig)
