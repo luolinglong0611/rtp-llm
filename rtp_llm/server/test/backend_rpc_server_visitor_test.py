@@ -520,6 +520,18 @@ class _CapacityThenBatchSloExpiredModelRpcClient:
         )
 
 
+class _ClosableModelRpcClient:
+    def __init__(self):
+        self.closed = False
+
+    async def enqueue(self, _input):
+        try:
+            yield "first-output"
+            yield "second-output"
+        finally:
+            self.closed = True
+
+
 class BackendRPCServerVisitorRetryTest(unittest.IsolatedAsyncioTestCase):
     def _visitor(self, model_rpc_client) -> BackendRPCServerVisitor:
         visitor = BackendRPCServerVisitor.__new__(BackendRPCServerVisitor)
@@ -765,6 +777,16 @@ class BackendRPCServerVisitorRetryTest(unittest.IsolatedAsyncioTestCase):
             ExceptionType.PRIORITY_PREEMPTED,
         )
         self.assertEqual(client.attempts, 2)
+
+    async def test_closing_outer_stream_closes_nested_model_rpc_stream(self):
+        client = _ClosableModelRpcClient()
+        visitor = self._visitor(client)
+
+        stream = await visitor.enqueue(_FakeInput(is_streaming=True))
+        self.assertEqual(await stream.__anext__(), "first-output")
+        await stream.aclose()
+
+        self.assertTrue(client.closed)
 
 
 if __name__ == "__main__":

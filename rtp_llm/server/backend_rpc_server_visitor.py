@@ -633,6 +633,7 @@ class BackendRPCServerVisitor:
             first_exc: Optional[BaseException] = None
             while True:
                 yielded_output = False
+                stream = None
                 try:
                     stream = await route_and_enqueue(attempt_input)
                     if is_streaming:
@@ -699,6 +700,14 @@ class BackendRPCServerVisitor:
                         e,
                     )
                     await asyncio.sleep(min(0.2, 0.05 * attempt))
+                finally:
+                    # Closing this wrapper (for example when a renderer guard
+                    # finishes early) must synchronously close the nested
+                    # ModelRpcClient stream so its gRPC call is cancelled now,
+                    # rather than at GC or after a ghost generation completes.
+                    close_stream = getattr(stream, "aclose", None)
+                    if close_stream is not None:
+                        await close_stream()
 
         return stream_with_aux_info()
 
