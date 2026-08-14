@@ -19,6 +19,13 @@ config_setting(
     },
 )
 
+config_setting(
+    name = "using_ppu",
+    define_values = {
+        "use_ppu": "true",
+    },
+)
+
 # Equivalent to using_clang && -c opt.
 config_setting(
     name = "using_clang_opt",
@@ -59,8 +66,21 @@ cc_library(
 
 cc_library(
     name = "cudart",
-    srcs = ["cuda/lib/%{cudart_lib}"],
-    data = ["cuda/lib/%{cudart_lib}"],
+    srcs = select({
+        ":using_ppu": [],
+        "//conditions:default": ["cuda/lib/%{cudart_lib}"],
+    }),
+    data = select({
+        ":using_ppu": [],
+        "//conditions:default": ["cuda/lib/%{cudart_lib}"],
+    }),
+    linkopts = select({
+        ":using_ppu": [
+            "-L/usr/local/PPU_SDK/CUDA_SDK/lib64",
+            "-l:libcudart.so.12",
+        ],
+        "//conditions:default": [],
+    }),
     linkstatic = 1,
     tags = ["no-remote"],
 )
