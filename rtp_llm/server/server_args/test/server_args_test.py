@@ -173,6 +173,12 @@ class ServerArgsSetTest(TestCase):
             py_env_configs.pd_separation_config.max_rpc_timeout_ms, 7200000
         )
 
+        # The TCP cache-store queue must absorb concurrent PD handoff bursts.
+        self.assertEqual(
+            py_env_configs.cache_store_config.cache_store_tcp_anet_rpc_queue_num,
+            1024,
+        )
+
         # Verify runtime_config (warm_up is now in RuntimeConfig)
         self.assertEqual(py_env_configs.runtime_config.warm_up, True)  # bool in C++
         self.assertEqual(py_env_configs.runtime_config.warm_up_with_loss, False)
@@ -229,6 +235,8 @@ class ServerArgsSetTest(TestCase):
             "4",
             "--cache_store_rdma_worker_thread_count",
             "2",
+            "--cache_store_tcp_anet_rpc_queue_num",
+            "2048",
             "--enable_flashinfer_trtllm_gen",
             "false",
             "--enable_flashinfer_trt_fmha_v2",
@@ -301,6 +309,10 @@ class ServerArgsSetTest(TestCase):
         # Verify cache_store_config
         self.assertEqual(py_env_configs.cache_store_config.rdma_io_thread_count, 4)
         self.assertEqual(py_env_configs.cache_store_config.rdma_worker_thread_count, 2)
+        self.assertEqual(
+            py_env_configs.cache_store_config.cache_store_tcp_anet_rpc_queue_num,
+            2048,
+        )
 
         # Verify fmha_config
         self.assertFalse(py_env_configs.fmha_config.enable_flashinfer_trtllm_gen)

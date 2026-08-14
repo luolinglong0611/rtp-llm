@@ -362,7 +362,7 @@ struct CacheStoreConfig {
     int64_t p2p_layer_cache_buffer_store_timeout_ms      = 100 * 1000;
     int64_t p2p_cancel_broadcast_timeout_ms              = 1000;
     int     cache_store_tcp_anet_rpc_thread_num          = 3;
-    int     cache_store_tcp_anet_rpc_queue_num           = 100;
+    int     cache_store_tcp_anet_rpc_queue_num           = 1024;
 
     std::string to_string() const;
 };

@@ -14,7 +14,9 @@ TcpServer::~TcpServer() {
 bool TcpServer::init(uint32_t io_thread_count,
                      uint32_t worker_thread_count,
                      bool     enable_metric,
-                     uint32_t worker_queue_size) {
+                     uint32_t worker_queue_size,
+                     uint32_t anet_rpc_thread_num,
+                     uint32_t anet_rpc_queue_num) {
     if (rpc_server_transport_ == nullptr) {
         rpc_server_transport_.reset(new anet::Transport(io_thread_count));
         if (!rpc_server_transport_ || !rpc_server_transport_->start()) {
@@ -23,7 +25,7 @@ bool TcpServer::init(uint32_t io_thread_count,
         rpc_server_transport_->setName("TcpServer");
     }
 
-    rpc_server_.reset(new arpc::ANetRPCServer(rpc_server_transport_.get(), 3, 100));
+    rpc_server_.reset(new arpc::ANetRPCServer(rpc_server_transport_.get(), anet_rpc_thread_num, anet_rpc_queue_num));
     if (enable_metric) {
         arpc::KMonitorANetMetricReporterConfig metricConfig;
         metricConfig.metricLevel                 = kmonitor::FATAL;
@@ -44,10 +46,13 @@ bool TcpServer::init(uint32_t io_thread_count,
         return false;
     }
 
-    RTP_LLM_LOG_INFO("tcp server init success, io thread count %d, worker thread count %d, worker queue size %d",
+    RTP_LLM_LOG_INFO("tcp server init success, io thread count %d, worker thread count %d, "
+                     "worker queue size %d, anet rpc thread count %d, rpc queue size %d",
                      io_thread_count,
                      worker_thread_count,
-                     worker_queue_size);
+                     worker_queue_size,
+                     anet_rpc_thread_num,
+                     anet_rpc_queue_num);
     return true;
 }
 

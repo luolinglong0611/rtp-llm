@@ -55,9 +55,11 @@ bool TcpServer::init(uint32_t io_thread_count,
 
     listen_port_ = listen_port;
 
-    RTP_LLM_LOG_INFO("tcp server init success, io thread count %d, worker thread count %d, worker queue size %d",
+    RTP_LLM_LOG_INFO("tcp server init success, io thread count %d, worker thread count %d, "
+                     "anet rpc thread count %d, rpc queue size %d",
                      io_thread_count,
                      worker_thread_count,
+                     anet_rpc_thread_num,
                      anet_rpc_queue_num);
     return true;
 }

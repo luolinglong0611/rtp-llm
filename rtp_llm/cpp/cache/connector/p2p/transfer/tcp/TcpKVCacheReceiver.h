@@ -22,7 +22,7 @@ public:
               int      io_thread_count,
               int      worker_thread_count,
               uint32_t anet_rpc_thread_num    = 3,
-              uint32_t anet_rpc_queue_num     = 100,
+              uint32_t anet_rpc_queue_num     = 1024,
               int64_t  wait_check_interval_us = 1000);
 
     /// @brief No-op for TCP mode: memory registration is not required.
