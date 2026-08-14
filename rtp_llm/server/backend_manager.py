@@ -11,7 +11,10 @@ from rtp_llm.config.py_config_modules import PyEnvConfigs
 from rtp_llm.distribute.distributed_server import DistributedServer, get_world_info
 from rtp_llm.metrics import kmonitor
 from rtp_llm.model_factory import ModelFactory
-from rtp_llm.models_py.distributed.collective_torch import init_distributed_environment
+from rtp_llm.models_py.distributed.collective_torch import (
+    destroy_distributed_environment,
+    init_distributed_environment,
+)
 from rtp_llm.utils.concurrency_controller import get_global_controller
 
 if TYPE_CHECKING:
@@ -37,6 +40,7 @@ class BackendManager(object):
             kmonitor.init()
         self.engine: Optional["BaseEngine"] = None
         self._shutdown_requested = threading.Event()
+        self._stopped = threading.Event()
 
     def start(self):
         """Initialize backend server without entering service loop"""
@@ -167,25 +171,54 @@ class BackendManager(object):
 
     def stop(self) -> None:
         """Stop the backend manager and cleanup resources"""
-        if self.engine is not None:
-            from rtp_llm.utils.fuser import _nfs_manager
+        if self._stopped.is_set():
+            logging.info("BackendManager already stopped")
+            return
+        self._stopped.set()
+        engine = self.engine
+        self.engine = None
 
-            engine_stop_error = None
+        shutdown_error = None
+        try:
+            if engine is not None:
+                logging.info("stopping backend engine before unmounting nfs paths")
+                engine.stop()
+                logging.info("backend engine stopped")
+        except Exception as error:
+            shutdown_error = error
+            logging.exception("engine stop failed during backend shutdown")
+        finally:
             try:
-                self.engine.stop()
-            except Exception as e:
-                engine_stop_error = e
-                logging.exception("engine stop failed during backend shutdown")
-            finally:
-                try:
-                    _nfs_manager.unmount_all()
-                    logging.info("all nfs paths unmounted")
-                except Exception:
-                    logging.exception("nfs unmount failed during backend shutdown")
-                    if engine_stop_error is None:
-                        raise
-            if engine_stop_error is not None:
-                raise engine_stop_error
+                from rtp_llm.models_py.distributed.deepep_wrapper import (
+                    DeepEPWrapper,
+                )
+
+                if DeepEPWrapper.is_initialized():
+                    DeepEPWrapper.reset()
+                    logging.info("DeepEP buffer destroyed")
+            except Exception:
+                logging.exception("Failed to destroy DeepEP buffer")
+
+            try:
+                import torch
+
+                if torch.distributed.is_initialized():
+                    destroy_distributed_environment()
+            except Exception:
+                logging.exception("Failed to destroy distributed environment")
+
+            try:
+                from rtp_llm.utils.fuser import _nfs_manager
+
+                _nfs_manager.unmount_all()
+                logging.info("all nfs paths unmounted")
+            except Exception as error:
+                logging.exception("nfs unmount failed during backend shutdown")
+                if shutdown_error is None:
+                    shutdown_error = error
+
+        if shutdown_error is not None:
+            raise shutdown_error
 
     def ready(self):
         if self.engine is not None:

@@ -5,6 +5,7 @@ combining the functionality of the previous DeepEPInitializer and DeepEPWrapper 
 """
 
 import gc
+import inspect
 import logging
 import os
 import platform
@@ -295,8 +296,25 @@ class DeepEPWrapper:
         """
         self._config = config
         self._use_accl_ep = use_accl_ep()
+        self._explicit_destroy = self._supports_explicit_destroy()
 
         self._mode, self._buffer = self._init_deepep_buffer(group)
+
+    @staticmethod
+    def _supports_explicit_destroy() -> bool:
+        if DeepEPBuffer is None or not hasattr(DeepEPBuffer, "destroy"):
+            return False
+        try:
+            return (
+                "explicitly_destroy"
+                in inspect.signature(DeepEPBuffer.__init__).parameters
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _set_explicit_destroy(self, init_kwargs: dict) -> None:
+        if self._explicit_destroy:
+            init_kwargs["explicitly_destroy"] = True
 
     @classmethod
     def supported(cls) -> bool:
@@ -554,6 +572,8 @@ class DeepEPWrapper:
             else:
                 init_kwargs["allow_mnnvl"] = False
 
+        self._set_explicit_destroy(init_kwargs)
+
         return DeepEPBuffer(**init_kwargs)  # type: ignore
 
     def _init_low_latency_buffer(self, group: ProcessGroup) -> DeepEPBuffer:
@@ -594,6 +614,8 @@ class DeepEPWrapper:
                 init_kwargs["allow_mnnvl"] = True
             else:
                 init_kwargs["allow_mnnvl"] = False
+
+        self._set_explicit_destroy(init_kwargs)
 
         return DeepEPBuffer(**init_kwargs)  # type: ignore
 
@@ -641,13 +663,18 @@ class DeepEPWrapper:
             init_kwargs["allow_nvlink_for_low_latency_mode"] = True
             init_kwargs["allow_mnnvl"] = False
 
+        self._set_explicit_destroy(init_kwargs)
+
         return DeepEPBuffer(**init_kwargs)  # type: ignore
 
     def _destroy_buffer(self) -> None:
         """Destroy the DeepEP buffer and free resources."""
-        if self._buffer is not None:
-            del self._buffer
-            self._buffer = None
+        buffer = self._buffer
+        self._buffer = None
+        if buffer is not None:
+            if self._explicit_destroy:
+                buffer.destroy()
+            del buffer
         gc.collect()
 
 
