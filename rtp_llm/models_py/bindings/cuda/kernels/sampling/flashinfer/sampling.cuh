@@ -37,9 +37,9 @@
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
-// Define reduction operators based on CUDA version
-// CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
+// CCCL 2.8 adds cuda::maximum/minimum, and CUB 3 removes cub::Max/Min.
+// Gate on the CUB version because compiler and CUB versions can differ.
+#if defined(CUB_VERSION) && CUB_VERSION >= 200800
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
 #else
