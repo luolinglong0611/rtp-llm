@@ -125,6 +125,10 @@ class GenerateConfig(BaseModel):
     # only for qwen agent fncall check max input tokens
     max_input_tokens: int = 32000
     max_thinking_tokens: int = 32000
+    # Whether runtime answer guards may bound the final-answer phase after
+    # adaptive thinking closes. Keep the legacy default enabled; renderers that
+    # can prove a budget is user-explicit opt that request out.
+    enable_thinking_answer_guard: bool = True
     in_think_mode: bool = (
         False  # same as `enable_thinking` in chat_template_kwargs, discard one in the future
     )

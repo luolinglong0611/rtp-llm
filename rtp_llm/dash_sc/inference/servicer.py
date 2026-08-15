@@ -733,6 +733,10 @@ def _apply_dash_sc_controls_to_generate_config(
     request_max_think = sampling.max_new_think_tokens
     if request_max_think is None:
         request_max_think = request_controls.max_new_think_tokens
+    # A request-scoped budget is explicit, so it must not silently enable the
+    # adaptive final-answer guards. Requests using only the service default
+    # retain the legacy guarded behavior.
+    generate_config.enable_thinking_answer_guard = request_max_think is None
     if request_max_think is not None:
         max_think = int(request_max_think)
         generate_config.max_thinking_tokens = _INT32_MAX if max_think < 0 else max_think

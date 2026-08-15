@@ -3259,6 +3259,7 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(generate_config.in_think_mode)
         self.assertEqual(generate_config.max_thinking_tokens, 32000)
         self.assertEqual(generate_config.structural_tag["format"]["type"], "sequence")
+        self.assertTrue(generate_config.enable_thinking_answer_guard)
 
     async def test_dash_generation_response_format_is_finalized_before_enqueue(
         self,
@@ -3502,6 +3503,7 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
                     think_branch["elements"][0]["content"]["max_tokens"], 10
                 )
                 self.assertEqual(think_branch["elements"][1]["type"], "json_schema")
+                self.assertFalse(generate_config.enable_thinking_answer_guard)
 
     async def test_max_completion_tokens_thinking_budget_keeps_backend_limit_repro(
         self,

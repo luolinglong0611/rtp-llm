@@ -49,6 +49,7 @@ TEST_F(QueryConverterTest, testTransInput) {
     generate_config_pb->set_calculate_loss(1);
     generate_config_pb->set_return_hidden_states(true);
     generate_config_pb->set_thinking_mode(GenerateConfigPB::THINKING_MODE_ADAPTIVE);
+    generate_config_pb->mutable_enable_thinking_answer_guard()->set_value(true);
     for (int i = 0; i < 2; ++i) {
         auto* stop_words = generate_config_pb->mutable_stop_words_list()->add_rows();
         for (int j = 0; j < 3; ++j) {
@@ -83,6 +84,7 @@ TEST_F(QueryConverterTest, testTransInput) {
     ASSERT_EQ(generate_config->task_id.value(), "8");
     ASSERT_EQ(generate_config->calculate_loss, 1);
     ASSERT_TRUE(generate_config->return_hidden_states);
+    ASSERT_TRUE(generate_config->enable_thinking_answer_guard);
     ASSERT_FALSE(generate_config->return_logits);
     ASSERT_EQ(generate_config->thinking_mode, ThinkingMode::ADAPTIVE);
     ASSERT_EQ(generate_config->stop_words_list.size(), 2);
@@ -163,6 +165,19 @@ TEST_F(QueryConverterTest, RoleAddrPreservesPdfusionDefaultAndRejectsConflicts) 
     GenerateConfigPB omitted_legacy_default;
     omitted_legacy_default.add_role_addrs();
     EXPECT_EQ(QueryConverter::getRoleAddrs(&omitted_legacy_default)[0].role, RoleType::PDFUSION);
+}
+
+TEST_F(QueryConverterTest, ThinkingAnswerGuardPreservesLegacyDefaultAndExplicitOptOut) {
+    GenerateInputPB input;
+    input.add_token_ids(0);
+    input.mutable_generate_config();
+
+    auto legacy_config = QueryConverter::transQuery(&input)->generate_config;
+    EXPECT_TRUE(legacy_config->enable_thinking_answer_guard);
+
+    input.mutable_generate_config()->mutable_enable_thinking_answer_guard()->set_value(false);
+    auto explicit_config = QueryConverter::transQuery(&input)->generate_config;
+    EXPECT_FALSE(explicit_config->enable_thinking_answer_guard);
 }
 
 TEST_F(QueryConverterTest, testTransOutput) {

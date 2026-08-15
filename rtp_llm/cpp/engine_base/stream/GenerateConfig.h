@@ -110,6 +110,7 @@ public:
     bool               in_think_mode       = false;
     ThinkingMode       thinking_mode       = ThinkingMode::UNSPECIFIED;
     int                max_thinking_tokens = 0;
+    bool               enable_thinking_answer_guard = true;
     std::vector<int>   begin_think_token_ids;
     std::vector<int>   end_think_token_ids;
     bool               gen_timeline = false;
@@ -205,6 +206,7 @@ public:
                      << ", can_use_pd_separation: " << can_use_pd_separation << ", pd_separation: " << pd_separation
                      << ", in_think_mode: " << in_think_mode << ", thinking_mode: " << static_cast<int>(thinking_mode)
                      << ", max_thinking_tokens: " << max_thinking_tokens
+                     << ", enable_thinking_answer_guard: " << enable_thinking_answer_guard
                      << ", begin_think_token_ids: " << vectorToString(begin_think_token_ids)
                      << ", end_think_token_ids: " << vectorToString(end_think_token_ids)
                      << ", gen_timeline: " << gen_timeline << ", profile_step: " << profile_step
@@ -323,6 +325,7 @@ public:
         json.Jsonize("thinking_mode", thinking_mode_int, thinking_mode_int);
         thinking_mode = normalizeThinkingMode(thinking_mode_int);
         JSONIZE(max_thinking_tokens);
+        JSONIZE(enable_thinking_answer_guard);
         JSONIZE(begin_think_token_ids);
         JSONIZE(end_think_token_ids);
         JSONIZE(gen_timeline);

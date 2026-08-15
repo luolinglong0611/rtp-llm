@@ -338,6 +338,7 @@ class ModelRpcClientTest(TestCase):
             in_think_mode=True,
             end_think_token_ids=[7],
             max_thinking_tokens=16,
+            enable_thinking_answer_guard=True,
         )
         config.finalize_response_format(
             reasoning_format=ReasoningFormat(tag_begin="", tag_end="</think>")
@@ -347,6 +348,10 @@ class ModelRpcClientTest(TestCase):
         input_pb = trans_input(self._make_generate_input(config))
 
         self.assertEqual(config.model_dump(), config_before_rpc)
+        self.assertTrue(
+            input_pb.generate_config.HasField("enable_thinking_answer_guard")
+        )
+        self.assertTrue(input_pb.generate_config.enable_thinking_answer_guard.value)
         structural_tag = json.loads(input_pb.generate_config.structural_tag.value)
         elements = structural_tag["format"]["elements"]
         self.assertEqual(len(elements), 2)
@@ -373,6 +378,16 @@ class ModelRpcClientTest(TestCase):
         actual = outputs.generate_outputs[0].aux_info
         self.assertEqual(actual.speculative_draft_rounds, 7)
         self.assertEqual(actual.speculative_accepted_tokens_per_pos, [6, 4, 2])
+
+    def test_trans_input_preserves_explicit_thinking_answer_guard_opt_out(self):
+        config = GenerateConfig(enable_thinking_answer_guard=False)
+
+        input_pb = trans_input(self._make_generate_input(config))
+
+        self.assertTrue(
+            input_pb.generate_config.HasField("enable_thinking_answer_guard")
+        )
+        self.assertFalse(input_pb.generate_config.enable_thinking_answer_guard.value)
 
     @unittest.skip("need fix")
     def test_generate_stream(self):

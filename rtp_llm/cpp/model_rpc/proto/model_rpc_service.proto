@@ -152,7 +152,7 @@ message GenerateConfigPB {
     google.protobuf.StringValue ebnf = 71;
     google.protobuf.StringValue structural_tag = 72;
     ThinkingModePB thinking_mode = 73;
-    reserved 74;
+    google.protobuf.BoolValue enable_thinking_answer_guard = 74;
 }
 
 message MMPreprocessConfigPB {
