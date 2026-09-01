@@ -142,6 +142,26 @@ sub_lib('flashinfer_single_prefill', single_decode, cuda_copts() + common_copts)
 sub_lib('flashinfer_single_prefill_256', single_decode_256, cuda_copts() + common_copts)
 sub_lib('flashinfer_sm90', [":generated_sm90"], sm90_cuda_copts)
 
+_FLASHINFER_AOT_SHARED_LIBS = [
+    ":flashinfer_single_decode",
+    ":flashinfer_single_decode_256",
+    ":flashinfer_single_prefill",
+    ":flashinfer_single_prefill_256",
+    ":flashinfer_batch_paged_prefill",
+    ":flashinfer_batch_paged_prefill_256",
+    ":flashinfer_batch_paged_decode",
+    ":flashinfer_batch_paged_decode_256",
+    ":flashinfer_batch_ragged_prefill",
+    ":flashinfer_batch_ragged_prefill_256",
+    ":flashinfer_sm90",
+]
+
+filegroup(
+    name = "flashinfer_aot_shared_libs",
+    srcs = _FLASHINFER_AOT_SHARED_LIBS,
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "flashinfer_mla",
     srcs = [
@@ -150,19 +170,7 @@ cc_library(
     ] + glob([
         "csrc/*.h",
         "csrc/*.inc",
-    ]) + [
-        "flashinfer_single_decode",
-        "flashinfer_single_decode_256",
-        "flashinfer_single_prefill",
-        "flashinfer_single_prefill_256",
-        "flashinfer_batch_paged_prefill",
-        "flashinfer_batch_paged_prefill_256",
-        "flashinfer_batch_paged_decode",
-        "flashinfer_batch_paged_decode_256",
-        "flashinfer_batch_ragged_prefill",
-        "flashinfer_batch_ragged_prefill_256",
-        "flashinfer_sm90"
-    ],
+    ]) + _FLASHINFER_AOT_SHARED_LIBS,
     implementation_deps = [
         ":dispatch",
         ":flashinfer_hdrs",
@@ -199,19 +207,7 @@ cc_library(
     ] + glob([
         "csrc/*.h",
         "csrc/*.inc",
-    ]) + [
-        "flashinfer_single_decode",
-        "flashinfer_single_decode_256",
-        "flashinfer_single_prefill",
-        "flashinfer_single_prefill_256",
-        "flashinfer_batch_paged_prefill",
-        "flashinfer_batch_paged_prefill_256",
-        "flashinfer_batch_paged_decode",
-        "flashinfer_batch_paged_decode_256",
-        "flashinfer_batch_ragged_prefill",
-        "flashinfer_batch_ragged_prefill_256",
-        "flashinfer_sm90"
-    ],
+    ]) + _FLASHINFER_AOT_SHARED_LIBS,
     implementation_deps = [
         ":flashinfer_mla",
         ":dispatch",

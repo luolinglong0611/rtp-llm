@@ -5,6 +5,17 @@ package(default_visibility = ["//rtp_llm:__subpackages__"])
 
 copy_all_so()
 
+# CUDA 13 links these AOT kernels as standalone DSOs.  Copy them into this
+# package so librtp_compute_ops.so can resolve them through its $ORIGIN rpath.
+copy_files(
+    name = "copy_cuda13_flashinfer_aot_libs",
+    srcs = select({
+        "//:using_cuda13_arm": ["@flashinfer_cpp_cu13//:flashinfer_aot_shared_libs"],
+        "//:using_cuda13_x86": ["@flashinfer_cpp_cu13//:flashinfer_aot_shared_libs"],
+        "//conditions:default": [],
+    }),
+)
+
 # copy 3fs libs
 copy_files(
     name = "copy_hf3fs_libs",
@@ -55,6 +66,7 @@ filegroup(
     name = "whl_package_libs",
     srcs = [],
     data = [
+        ":copy_cuda13_flashinfer_aot_libs",
         ":librtp_compute_ops_so",
         ":libth_grammar_tokenizer_info_so",
         ":libth_transformer_config_so",
