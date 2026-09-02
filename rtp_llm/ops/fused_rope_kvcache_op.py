@@ -42,6 +42,21 @@ def _get_prefill_position_ids_keyword(
     )
 
 
+@cache
+def _decode_uses_sequence_lengths(
+    decode_op: Callable[..., torch.Tensor],
+) -> bool:
+    parameters = inspect.signature(decode_op).parameters
+    if "sequence_lengths" in parameters:
+        return True
+    if "batch_size" in parameters:
+        return False
+    raise RuntimeError(
+        "rtp_kernel decode_fused_rope_kvcache has an unsupported signature: "
+        "batch_size is missing"
+    )
+
+
 @dataclass
 class FusedRopeAttnParams:
     kv_cache_offset: Optional[torch.Tensor]
@@ -235,16 +250,20 @@ class FusedRopeKVCacheDecodeOp:
         assert params.sequence_lengths.is_cuda or params.sequence_lengths.is_pinned(), (
             "sequence_lengths must be CUDA or pinned host memory"
         )
-        return _get_fused_rope_kvcache().decode_fused_rope_kvcache(
+        decode_op = _get_fused_rope_kvcache().decode_fused_rope_kvcache
+        sequence_lengths_kwargs = {}
+        if _decode_uses_sequence_lengths(decode_op):
+            sequence_lengths_kwargs["sequence_lengths"] = params.sequence_lengths
+
+        return decode_op(
             qkv,
             params.position_ids,
-            params.sequence_lengths,
-            params.sequence_lengths.size(0),
-            self.attn_configs.head_num,
-            self.attn_configs.kv_head_num,
-            self.attn_configs.size_per_head,
-            kv_cache.kv_cache_base,
-            params.kv_cache_offset,
+            batch_size=params.sequence_lengths.size(0),
+            head_num=self.attn_configs.head_num,
+            kv_head_num=self.attn_configs.kv_head_num,
+            size_per_head=self.attn_configs.size_per_head,
+            kv_cache=kv_cache.kv_cache_base,
+            kv_cache_offset=params.kv_cache_offset,
             tokens_per_block=self.attn_configs.kernel_tokens_per_block,
             store_kv=False,
             kv_cache_scale=self._get_kv_scale(kv_cache),
@@ -267,6 +286,7 @@ class FusedRopeKVCacheDecodeOp:
             rope_mrope_dim1=rope_config.mrope_dim1,
             rope_mrope_dim2=rope_config.mrope_dim2,
             rope_mrope_dim3=rope_config.mrope_dim3,
+            **sequence_lengths_kwargs,
         )
 
     def prepare(self, attn_inputs: PyAttentionInputs) -> FusedRopeAttnParams:
