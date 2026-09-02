@@ -63,6 +63,28 @@ requires_shared_acl = unittest.skipUnless(
 )
 
 
+class JitRuntimePathTest(unittest.TestCase):
+    def test_prepends_python_scripts_directory(self):
+        with mock.patch.object(
+            jit.sysconfig, "get_path", return_value="/opt/conda310/bin"
+        ), mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/usr/bin"}):
+            jit._ensure_python_scripts_on_path()
+            self.assertEqual(
+                os.environ["PATH"], "/opt/conda310/bin:/usr/local/bin:/usr/bin"
+            )
+
+    def test_does_not_duplicate_python_scripts_directory(self):
+        with mock.patch.object(
+            jit.sysconfig, "get_path", return_value="/opt/conda310/bin"
+        ), mock.patch.dict(
+            os.environ, {"PATH": "/usr/local/bin:/opt/conda310/bin:/usr/bin"}
+        ):
+            jit._ensure_python_scripts_on_path()
+            self.assertEqual(
+                os.environ["PATH"], "/usr/local/bin:/opt/conda310/bin:/usr/bin"
+            )
+
+
 def contents(root: Path) -> dict[str, bytes]:
     return {
         path.relative_to(root).as_posix(): path.read_bytes()
@@ -942,10 +964,13 @@ class BackendTest(JitCacheTestBase):
     def test_manage_jit_cache_false_skips_all_setup(self):
         config = self.make_configs(remote="/r").jit_config
         config.manage_jit_cache = False
-        with mock.patch.object(jit, "setup_jit_cache_env") as setup, mock.patch.object(
-            jit, "JitCacheManager"
-        ) as manager:
+        with mock.patch.object(
+            jit, "_ensure_python_scripts_on_path"
+        ) as ensure_path, mock.patch.object(
+            jit, "setup_jit_cache_env"
+        ) as setup, mock.patch.object(jit, "JitCacheManager") as manager:
             self.assertIsNone(jit.start_from_config(config))
+        ensure_path.assert_called_once_with()
         setup.assert_not_called()
         manager.assert_not_called()
 
