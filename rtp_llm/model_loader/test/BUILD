@@ -69,3 +69,9 @@ py_test(
         'gpu': 'MI308X-ROCM7',
     },
 )
+
+py_test(
+    name = "test_loader_memory_estimate",
+    srcs = ["test_loader_memory_estimate.py"],
+    deps = py_test_deps,
+)

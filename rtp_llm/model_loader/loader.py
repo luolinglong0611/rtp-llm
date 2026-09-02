@@ -9,7 +9,10 @@ import torch
 import torch.nn.functional as F
 
 from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.config.quant_config import Fp8PerChannelCompressedQuantConfig
+from rtp_llm.config.quant_config import (
+    Fp8BlockWiseQuantConfig,
+    Fp8PerChannelCompressedQuantConfig,
+)
 from rtp_llm.lora.lora_weights import LoRAWeights
 from rtp_llm.model_loader.ffn_weight import iter_stacked_moe_weights
 from rtp_llm.model_loader.load_config import LoadConfig, LoadMethod
@@ -323,6 +326,16 @@ class ModelLoader:
                     f"online PTPC but no MoE weights detected, "
                     f"doubling model_mem estimate conservatively"
                 )
+        elif self._is_online_fp8_per_block():
+            # Fastsafetensors loads one shard batch at a time and each
+            # FP8_PER_BLOCK component is quantized as soon as its collector is
+            # complete.  The BF16 source therefore does not coexist with the
+            # full FP8 model.  The 3 * max_file_mem reserve below covers the
+            # source tensor, quantized output, and loader prefetch buffers.
+            logging.info(
+                "online FP8_PER_BLOCK detected: using streaming model_mem "
+                "estimate; BF16 transient memory is covered by the shard reserve"
+            )
         elif self._is_online_quant_without_inline():
             # Non-inline online quantization: BF16 checkpoint loaded then
             # quantized to FP8, so peak memory is roughly 2x FP8 model size.
@@ -375,6 +388,14 @@ class ModelLoader:
             and quant_config is not None
             and not quant_config.is_quanted()
             and not self._is_online_ptpc()
+        )
+
+    def _is_online_fp8_per_block(self) -> bool:
+        """Check for streaming BF16-to-FP8 per-block quantization."""
+        quant_config = getattr(self._weights_info, "_quant_config", None)
+        return (
+            isinstance(quant_config, Fp8BlockWiseQuantConfig)
+            and not quant_config.is_quanted()
         )
 
     def _should_inline_fp8_quantize(self, weight_info) -> bool:
