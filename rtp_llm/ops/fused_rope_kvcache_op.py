@@ -1,6 +1,7 @@
+import inspect
 from dataclasses import dataclass
 from functools import cache
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -19,6 +20,26 @@ def _get_fused_rope_kvcache():
     from rtp_kernel import fused_rope_kvcache
 
     return fused_rope_kvcache
+
+
+@cache
+def _get_prefill_position_ids_keyword(
+    prefill_op: Callable[..., torch.Tensor],
+) -> str:
+    parameters = inspect.signature(prefill_op).parameters
+    if "position_ids" in parameters:
+        return "position_ids"
+    if "cp_position_ids" in parameters:
+        return "cp_position_ids"
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return "position_ids"
+    raise RuntimeError(
+        "rtp_kernel prefill_fused_rope_kvcache supports neither "
+        "position_ids nor cp_position_ids"
+    )
 
 
 @dataclass
@@ -93,7 +114,10 @@ class FusedRopeKVCachePrefillOpBase:
         rope_config = self.attn_configs.rope_config
         rope_cache = get_rope_cache_once(rope_config, self.attn_configs.max_seq_len)
 
-        return _get_fused_rope_kvcache().prefill_fused_rope_kvcache(
+        prefill_op = _get_fused_rope_kvcache().prefill_fused_rope_kvcache
+        position_ids_keyword = _get_prefill_position_ids_keyword(prefill_op)
+
+        return prefill_op(
             qkv,
             params.cu_seqlens,
             params.cu_seqlens.size(0) - 1,
@@ -117,7 +141,6 @@ class FusedRopeKVCachePrefillOpBase:
                 rope_cache.data if check_rope_cache(rope_config, rope_cache) else None
             ),
             padding_offset=params.padding_offset,
-            position_ids=params.position_ids,
             use_logn_attn=self.attn_configs.use_logn_attn,
             rope_style=rope_config.style,
             rope_dim=rope_config.dim,
@@ -136,6 +159,7 @@ class FusedRopeKVCachePrefillOpBase:
             prefix_prompt_lengths=params.prefix_lengths,
             max_prefix_length=params.max_prefix_length,
             count_length=params.max_prefix_length > 0,
+            **{position_ids_keyword: params.position_ids},
         )
 
     def forward(
