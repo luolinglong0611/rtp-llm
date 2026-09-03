@@ -1,6 +1,7 @@
 import json
 from typing import Any
 
+from rtp_llm.config.generate_config import ThinkingMode
 from rtp_llm.openai.api_datatype import ChatCompletionRequest
 from rtp_llm.openai.renderer_factory_register import register_renderer
 from rtp_llm.openai.renderers.basic_renderer import PromptWithMMInput
@@ -24,6 +25,29 @@ class Qwen35Renderer(Qwen3CoderRenderer, Qwen2VLRenderer):
     def _render_messages(
         self, request: ChatCompletionRequest, add_vision_id: bool
     ) -> PromptWithMMInput:
+        thinking_mode = self.resolve_thinking_mode(request)
+        if thinking_mode != ThinkingMode.ADAPTIVE:
+            # Qwen3.5's template enables thinking when enable_thinking is
+            # absent. Keep the prompt in sync with the fixed mode already
+            # resolved for GenerateConfig, including the server-side
+            # THINK_MODE default and top-level request overrides.
+            chat_template_kwargs = dict(request.get_chat_template_kwargs() or {})
+            chat_template_kwargs["enable_thinking"] = (
+                thinking_mode == ThinkingMode.ENABLED
+            )
+            if (
+                request.extra_configs is not None
+                and request.extra_configs.chat_template_kwargs is not None
+            ):
+                extra_configs = request.extra_configs.model_copy(
+                    update={"chat_template_kwargs": chat_template_kwargs}
+                )
+                request = request.model_copy(update={"extra_configs": extra_configs})
+            else:
+                request = request.model_copy(
+                    update={"chat_template_kwargs": chat_template_kwargs}
+                )
+
         return Qwen2VLRenderer._render_messages(self, request, add_vision_id)
 
     def render_chat(self, request: ChatCompletionRequest) -> RenderedInputs:

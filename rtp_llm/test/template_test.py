@@ -386,6 +386,59 @@ class TemplateTest(TestCase):
             "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         )
 
+    def test_qwen35_passes_disabled_server_mode_to_template(self):
+        generate_env_config = GenerateEnvConfig()
+        generate_env_config.think_mode = "disabled"
+        renderer = Qwen35Renderer(
+            _Qwen35DefaultTemplateTokenizer(),
+            RendererParams(
+                model_type="qwen35_dense",
+                max_seq_len=1024,
+                eos_token_id=0,
+                stop_word_ids_list=[],
+            ),
+            generate_env_config,
+            RenderConfig(),
+        )
+
+        rendered_prompt = renderer.render_chat(
+            ChatCompletionRequest(
+                messages=[ChatMessage(role=RoleEnum.user, content="hello")]
+            )
+        ).rendered_prompt
+
+        assert rendered_prompt == (
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+
+    def test_qwen35_top_level_thinking_override_reaches_template(self):
+        generate_env_config = GenerateEnvConfig()
+        generate_env_config.think_mode = "enabled"
+        renderer = Qwen35Renderer(
+            _Qwen35DefaultTemplateTokenizer(),
+            RendererParams(
+                model_type="qwen35_dense",
+                max_seq_len=1024,
+                eos_token_id=0,
+                stop_word_ids_list=[],
+            ),
+            generate_env_config,
+            RenderConfig(),
+        )
+
+        rendered_prompt = renderer.render_chat(
+            ChatCompletionRequest(
+                messages=[ChatMessage(role=RoleEnum.user, content="hello")],
+                enable_thinking=False,
+            )
+        ).rendered_prompt
+
+        assert rendered_prompt == (
+            "<|im_start|>user\nhello<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+
     def test_basic_renderer_preserves_template_thinking_default(self):
         generate_env_config = GenerateEnvConfig()
         generate_env_config.think_mode = "enabled"
