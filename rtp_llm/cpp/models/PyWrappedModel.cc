@@ -704,10 +704,16 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool s
     }
 
     graph_state_         = CudaGraphState();
-    auto empty           = torch::Tensor();
+    auto empty = torch::Tensor();
+    // buildPyAttentionInputs() already staged combo_position_ids on CUDA.  The
+    // CUDA-graph pre-prepare path must expose that same tensor at the top-level
+    // PyModelInputs field: CudaGraphRunner validates and copies MRoPE position
+    // ids from there.  Passing an undefined tensor made every Qwen-VL decode
+    // pre-prepare report a fallback and forced the real forward to redo the
+    // graph input preparation synchronously.
     auto py_model_inputs = PyModelInputs({empty,
                                           empty,
-                                          empty,
+                                          attention_inputs_.combo_position_ids,
                                           torch_ext::PyEmbeddingInputs(),
                                           torch_ext::PyMultimodalInputs(),
                                           attention_inputs_,
@@ -733,7 +739,7 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
         auto empty           = torch::Tensor();
         auto py_model_inputs = PyModelInputs({empty,
                                               empty,
-                                              empty,
+                                              attention_inputs_.combo_position_ids,
                                               torch_ext::PyEmbeddingInputs(),
                                               torch_ext::PyMultimodalInputs(),
                                               attention_inputs_,

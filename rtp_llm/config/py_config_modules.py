@@ -308,6 +308,12 @@ class VitConfig:
         # with an overload error instead of growing unbounded. Scheduler-level
         # (like mm_timeout_ms): applies to serial and batch alike.
         self.mm_max_queue_size: int = 1024
+        # Local fusion can accept requests faster than the LLM scheduler can
+        # prefill them. Keeping every completed ViT embedding on GPU makes the
+        # queued request set consume unbounded device memory. When enabled,
+        # completed embeddings are staged on CPU and copied back by
+        # NormalModelInputGatherer only when the request enters a context batch.
+        self.mm_embedding_cpu_offload: bool = False
 
     def embedding_scheduler_args(self) -> Dict[str, int]:
         """Resolved MMScheduler kwargs, inferred from gpu_max_batch_size alone.
@@ -371,7 +377,8 @@ class VitConfig:
             f"gpu_batch_wait_ms: {self.gpu_batch_wait_ms}\n"
             f"gpu_max_batch_size: {self.gpu_max_batch_size}\n"
             f"gpu_max_batch_images: {self.gpu_max_batch_images}\n"
-            f"mm_max_queue_size: {self.mm_max_queue_size}"
+            f"mm_max_queue_size: {self.mm_max_queue_size}\n"
+            f"mm_embedding_cpu_offload: {self.mm_embedding_cpu_offload}"
         )
 
 

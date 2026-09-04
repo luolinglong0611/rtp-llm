@@ -522,6 +522,14 @@ class MMProcessEngine:
             )
         ]
         res = self.mm_embedding_impl(mm_inputs)
+        if self.vit_config.mm_embedding_cpu_offload:
+            # In local fusion, GenerateInput owns these tensors until the LLM
+            # scheduler admits the request. At high concurrency that queue can
+            # otherwise retain tens of GiB on the ViT device. The normal-engine
+            # gatherer already supports CPU features and copies only the active
+            # context batch back to CUDA.
+            res.embeddings = [embedding.cpu() for embedding in res.embeddings]
+            res.extra_input = [extra.cpu() for extra in res.extra_input]
         res.position_ids = [pos.cpu() for pos in res.position_ids]
         return res
 

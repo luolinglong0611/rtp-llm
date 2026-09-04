@@ -44,6 +44,14 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
         self.mm_processor = AutoProcessor.from_pretrained(
             mm_related_params.config["ckpt_path"]
         )
+        # RTP already samples the decoded video according to the request-level
+        # fps/max_frames settings in Qwen3_VLImageEmbedding.load_video().  The
+        # Transformers video processor defaults to sampling again, but tensors
+        # do not carry source-video metadata, so that second pass assumes 24 FPS
+        # and changes the requested frame count.  Keep every frame selected by
+        # RTP, matching the Qwen3.5-vLLM baseline's do_sample_frames=False.
+        if hasattr(self.mm_processor, "video_processor"):
+            self.mm_processor.video_processor.do_sample_frames = False
         self.mm_processor.image_processor = Qwen2VLImageProcessor.from_pretrained(
             mm_related_params.config["ckpt_path"]
         )

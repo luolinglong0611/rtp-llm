@@ -264,3 +264,11 @@ def init_vit_group_args(parser, vit_config):
         default=1024,
         help="mm embedding调度器等待队列容量上限；超出时提交快速失败并返回过载错误，防止forward卡住时内存无界增长",
     )
+    vit_group.add_argument(
+        "--mm_embedding_cpu_offload",
+        env_name="MM_EMBEDDING_CPU_OFFLOAD",
+        bind_to=(vit_config, "mm_embedding_cpu_offload"),
+        type=str2bool,
+        default=False,
+        help="将已完成但尚未进入Prefill的多模态embedding暂存到CPU，避免高并发请求耗尽GPU显存",
+    )
