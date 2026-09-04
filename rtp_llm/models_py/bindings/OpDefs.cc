@@ -264,7 +264,35 @@ void registerPyOpDefs(pybind11::module& m) {
             },
             "A PyAttentionInputs value or a tag-to-PyAttentionInputs mapping")
         .def_readwrite(
-            "bert_embedding_inputs", &PyModelInputs::bert_embedding_inputs, "BERT embedding inputs structure");
+            "bert_embedding_inputs", &PyModelInputs::bert_embedding_inputs, "BERT embedding inputs structure")
+        .def_readwrite("is_mixed_batch", &PyModelInputs::is_mixed_batch, "Whether this is a mixed decode/context batch")
+        .def_property(
+            "mixed_context_attention_inputs",
+            [](PyModelInputs& self) -> pybind11::object {
+                if (!self.mixed_context_attention_inputs_by_tag.empty()) {
+                    pybind11::dict result;
+                    for (auto& [tag, inputs] : self.mixed_context_attention_inputs_by_tag) {
+                        result[pybind11::str(tag)] = pybind11::cast(
+                            &inputs, pybind11::return_value_policy::reference_internal, pybind11::cast(&self));
+                    }
+                    return std::move(result);
+                }
+                return pybind11::cast(&self.mixed_context_attention_inputs,
+                                      pybind11::return_value_policy::reference_internal,
+                                      pybind11::cast(&self));
+            },
+            [](PyModelInputs& self, pybind11::object value) {
+                if (pybind11::isinstance<PyAttentionInputs>(value)) {
+                    self.mixed_context_attention_inputs        = value.cast<PyAttentionInputs>();
+                    self.mixed_context_attention_inputs_by_tag = {};
+                    return;
+                }
+                auto by_tag = value.cast<AttentionInputsByTag>();
+                RTP_LLM_CHECK_WITH_INFO(!by_tag.empty(), "mixed context attention_inputs tag map must not be empty");
+                self.mixed_context_attention_inputs        = by_tag.begin()->second;
+                self.mixed_context_attention_inputs_by_tag = std::move(by_tag);
+            },
+            "Context-side PyAttentionInputs for a mixed batch");
 
     pybind11::class_<PyModelOutputs>(m, "PyModelOutputs")
         .def(pybind11::init<>(), "Default constructor")

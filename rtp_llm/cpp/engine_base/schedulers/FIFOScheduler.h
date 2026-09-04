@@ -71,7 +71,7 @@ private:
                                const GenerateStreamPtr&            new_stream) override;
     // Counter-based admission check used by admitWaitingStreams(). evaluateRunningMemory()
     // is the list-based FIFOSchedulerBase entry point and delegates here.
-    bool   evaluateRunningBatch(const ScheduleRuntime& schedule_runtime, const GenerateStreamPtr& new_stream) const;
+    bool evaluateRunningBatch(const ScheduleRuntime& schedule_runtime, const GenerateStreamPtr& new_stream) const;
     // Overload for group-queue admission: the admitted streams are tracked as a list
     // because ScheduleRuntime is not built in the group-queue path.
     bool   evaluateRunningBatch(const std::list<GenerateStreamPtr>& streams, const GenerateStreamPtr& new_stream) const;
@@ -80,6 +80,8 @@ private:
                                   size_t                   admitted_max_seq_len,
                                   size_t                   admitted_sequence_count,
                                   const GenerateStreamPtr& candidate) const;
+    bool   fitsMixedKVCapacity(const GenerateStreamPtr&            candidate,
+                               const std::list<GenerateStreamPtr>* additionally_admitted = nullptr) const;
     size_t prefillTokenCostWithoutCache(const GenerateStreamPtr& stream) const;
     size_t prefillSeqLenWithCache(const GenerateStreamPtr& stream) const;
     size_t prefillTokenCostWithCache(const GenerateStreamPtr& stream) const;
@@ -121,6 +123,10 @@ private:
     // Context-parallel prefill can opt into single-request admission until
     // the model-side path supports per-request layouts.
     const bool cp_force_single_prefill_ = false;
+    // Opt-in mixed prefill+decode admission for the unified PDFUSION role.
+    // It is disabled for context parallel because that model path still
+    // requires pure-prefill batches.
+    const bool enable_mixed_continuous_batching_ = false;
     // Soft per-round quota on the tokens that are actually recomputed (prefix-cache hits
     // excluded). 0 disables it.
     const size_t max_batch_tokens_without_cache_ = 0;

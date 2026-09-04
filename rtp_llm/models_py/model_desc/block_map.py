@@ -28,7 +28,13 @@ def get_primary_attention_inputs(
     inputs: PyModelInputs, kv_cache: LayeredKVCache | None = None
 ) -> PyAttentionInputs:
     """Return the common/single fast-path value without interpreting tag names."""
-    value = get_attention_inputs_value(inputs)
+    return get_primary_attention_inputs_value(get_attention_inputs_value(inputs))
+
+
+def get_primary_attention_inputs_value(
+    value: AttentionInputs,
+) -> PyAttentionInputs:
+    """Return the primary input from an already-resolved value."""
     if isinstance(value, PyAttentionInputs):
         return value
     return next(iter(value.values()))
@@ -80,7 +86,17 @@ def select_attention_inputs_for_layer(
     local_layer_idx: int,
 ) -> PyAttentionInputs | list[PyAttentionInputs]:
     """Return the group-local input(s) owned by a model-local layer."""
-    value = get_attention_inputs_value(inputs)
+    return select_attention_inputs_value_for_layer(
+        get_attention_inputs_value(inputs), kv_cache, local_layer_idx
+    )
+
+
+def select_attention_inputs_value_for_layer(
+    value: AttentionInputs,
+    kv_cache: LayeredKVCache | None,
+    local_layer_idx: int,
+) -> PyAttentionInputs | list[PyAttentionInputs]:
+    """Select layer-local metadata from an already-resolved input value."""
     if isinstance(value, PyAttentionInputs):
         return value
 

@@ -78,7 +78,9 @@ public:
     void            updateKVCacheKernelBlockId(const GptModelInputs& inputs) override;
 
 private:
-    std::optional<PyCacheStoreInputs> prepareWriteCacheParams(const GptModelInputs& inputs);
+    std::optional<PyCacheStoreInputs>         prepareWriteCacheParams(const GptModelInputs& inputs);
+    GptModelOutputs                           forwardMixedBatched(const GptModelInputs& inputs);
+    std::pair<GptModelInputs, GptModelInputs> splitMixedInputs(const GptModelInputs& inputs) const;
 
 private:
     // Helper functions to reduce code duplication

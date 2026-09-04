@@ -17,6 +17,7 @@ class CacheStoreForwardModel:
         self.forward_calls = 0
         self.micro_batch_calls = 0
         self.seen_input_lengths: list[list[int]] = []
+        self.seen_batches: list[dict] = []
 
     def initialize(self, resources) -> bool:
         self.kv_cache = resources.kv_cache
@@ -34,26 +35,64 @@ class CacheStoreForwardModel:
         )
         self.seen_input_lengths.append(first_inputs.input_lengths.tolist())
 
-        assert self.kv_cache is not None
-        for layer_cache in self.kv_cache.get_layer_cache_groups(0):
-            tag_inputs = (
-                attention_inputs[layer_cache.tag]
-                if isinstance(attention_inputs, dict)
-                else attention_inputs
-            )
-            if (
-                tag_inputs.cache_store_inputs is not None
-                and tag_inputs.cache_store_writer is not None
-            ):
-                tag_inputs.cache_store_writer.write(
-                    tag_inputs.cache_store_inputs, layer_cache
-                )
+        def tolist_or_empty(value) -> list:
+            return [] if value is None else value.tolist()
 
-        hidden_states = torch.zeros(
-            (inputs.input_ids.numel(), 1),
-            dtype=torch.float16,
-            device=inputs.input_ids.device,
+        def summarize(value) -> dict:
+            first = next(iter(value.values())) if isinstance(value, dict) else value
+            return {
+                "input_lengths": first.input_lengths.tolist(),
+                "sequence_lengths": first.sequence_lengths.tolist(),
+                "prefix_lengths": first.prefix_lengths.tolist(),
+                "kv_cache_kernel_block_id": tolist_or_empty(
+                    first.kv_cache_kernel_block_id
+                ),
+                "is_prefill": first.is_prefill,
+            }
+
+        multimodal_features = inputs.multimodal_inputs.multimodal_features
+        self.seen_batches.append(
+            {
+                "input_ids": inputs.input_ids.tolist(),
+                "position_ids": tolist_or_empty(inputs.combo_position_ids),
+                "text_tokens_mask": tolist_or_empty(
+                    inputs.embedding_inputs.text_tokens_mask
+                ),
+                "mm_feature_locs": tolist_or_empty(
+                    inputs.multimodal_inputs.mm_features_locs
+                ),
+                "mm_feature_count": (
+                    0 if multimodal_features is None else len(multimodal_features)
+                ),
+                "attention": summarize(attention_inputs),
+                "mixed_context_attention": (
+                    summarize(inputs.mixed_context_attention_inputs)
+                    if getattr(inputs, "is_mixed_batch", False)
+                    else None
+                ),
+            }
         )
+
+        assert self.kv_cache is not None
+        attention_groups = [attention_inputs]
+        if getattr(inputs, "is_mixed_batch", False):
+            attention_groups.append(inputs.mixed_context_attention_inputs)
+        for group_inputs in attention_groups:
+            for layer_cache in self.kv_cache.get_layer_cache_groups(0):
+                tag_inputs = (
+                    group_inputs[layer_cache.tag]
+                    if isinstance(group_inputs, dict)
+                    else group_inputs
+                )
+                if (
+                    tag_inputs.cache_store_inputs is not None
+                    and tag_inputs.cache_store_writer is not None
+                ):
+                    tag_inputs.cache_store_writer.write(
+                        tag_inputs.cache_store_inputs, layer_cache
+                    )
+
+        hidden_states = inputs.input_ids.to(torch.float16).reshape(-1, 1)
         return PyModelOutputs(hidden_states)
 
     def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
@@ -192,6 +231,44 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
             all("model_id_7_" in block["key"] for block in record["blocks"])
         )
         self.assertTrue(all("_tag_draft" in block["key"] for block in record["blocks"]))
+
+    def test_mixed_batch_runs_one_model_forward_with_split_attention(self) -> None:
+        model = CacheStoreForwardModel()
+        result = run_scenario(model, "mixed_batch")
+
+        self.assertEqual(model.forward_calls, 1)
+        self.assertEqual(model.micro_batch_calls, 0)
+        self.assertTrue(result["mixed_split_host_tensors_pinned"])
+        self.assertEqual(
+            result["all_hidden_states"].flatten().tolist(), [11, 12, 21, 22, 23]
+        )
+
+        self.assertEqual(len(model.seen_batches), 1)
+        mixed = model.seen_batches[0]
+        self.assertEqual(
+            mixed,
+            {
+                "input_ids": [11, 12, 21, 22, 23],
+                "position_ids": list(range(100, 108)) + list(range(200, 212)),
+                "text_tokens_mask": [1, 1, 0, 0, 1],
+                "mm_feature_locs": [3],
+                "mm_feature_count": 1,
+                "attention": {
+                    "input_lengths": [8, 9],
+                    "sequence_lengths": [7, 8],
+                    "prefix_lengths": [],
+                    "kv_cache_kernel_block_id": [[1, -1], [2, -1]],
+                    "is_prefill": False,
+                },
+                "mixed_context_attention": {
+                    "input_lengths": [3],
+                    "sequence_lengths": [],
+                    "prefix_lengths": [0],
+                    "kv_cache_kernel_block_id": [[3, 4]],
+                    "is_prefill": True,
+                },
+            },
+        )
 
 
 if __name__ == "__main__":

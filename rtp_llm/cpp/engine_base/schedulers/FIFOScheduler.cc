@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <mutex>
+#include <unordered_set>
 
 using namespace std;
 namespace rtp_llm {
@@ -29,20 +31,29 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
                       metrics_reporter),
     cp_force_single_prefill_(parallelism_config.prefill_cp_config.is_enabled()
                              && runtime_config.fifo_scheduler_config.cp_force_single_prefill),
-    max_batch_tokens_without_cache_(static_cast<size_t>(
-        std::max<int64_t>(runtime_config.fifo_scheduler_config.max_batch_tokens_without_cache, 0))),
+    enable_mixed_continuous_batching_(runtime_config.fifo_scheduler_config.enable_mixed_continuous_batching
+                                      && pd_sep_config.role_type == RoleType::PDFUSION
+                                      && !parallelism_config.prefill_cp_config.is_enabled()),
+    max_batch_tokens_without_cache_(
+        static_cast<size_t>(std::max<int64_t>(runtime_config.fifo_scheduler_config.max_batch_tokens_without_cache, 0))),
     prefill_cp_size_(parallelism_config.prefill_cp_config.is_enabled() ?
                          static_cast<size_t>(std::max<int64_t>(parallelism_config.tp_size, 1)) :
                          1) {
     RTP_LLM_LOG_INFO("max_generate_batch_size is [%zu], max_batch_tokens_size is [%zu], "
                      "max_batch_tokens_without_cache is [%zu], cp_force_single_prefill is [%d], "
-                     "prefill_cp_size is [%zu], max_inited_kv_cache_streams is [%zu]",
+                     "enable_mixed_continuous_batching is [%d], prefill_cp_size is [%zu], "
+                     "max_inited_kv_cache_streams is [%zu]",
                      max_generate_batch_size_,
                      max_batch_tokens_size_,
                      max_batch_tokens_without_cache_,
                      cp_force_single_prefill_,
+                     enable_mixed_continuous_batching_,
                      prefill_cp_size_,
                      max_inited_kv_cache_streams_);
+    if (runtime_config.fifo_scheduler_config.enable_mixed_continuous_batching && !enable_mixed_continuous_batching_) {
+        RTP_LLM_LOG_WARNING("mixed continuous batching was requested but is only supported for PDFUSION without "
+                            "prefill context parallel; falling back to separated prefill/decode batches");
+    }
 }
 
 FIFOScheduler::~FIFOScheduler() {
@@ -136,8 +147,11 @@ bool FIFOScheduler::evaluateRunningBatch(const ScheduleRuntime&   schedule_runti
             return true;
         }
     }
-    // prefill and decode not mixed together
-    if (!running_streams_.empty()) {
+    // Default behavior keeps prefill and decode in separate scheduling rounds.
+    // The opt-in PDFUSION path admits context streams into a running decode
+    // batch; compatible models dispatch native decode/prefill attention inside
+    // one combined model forward.
+    if (!running_streams_.empty() && !enable_mixed_continuous_batching_) {
         return false;
     }
     // Conservative CP prefill mode: cap at one stream per round unless
@@ -146,6 +160,9 @@ bool FIFOScheduler::evaluateRunningBatch(const ScheduleRuntime&   schedule_runti
         return false;
     }
     if (running_streams_.size() + admitted_running_stream_count + 1 > max_generate_batch_size_) {
+        return false;
+    }
+    if (!fitsMixedKVCapacity(new_stream)) {
         return false;
     }
 
@@ -167,13 +184,16 @@ bool FIFOScheduler::evaluateRunningBatch(const std::list<GenerateStreamPtr>& str
             return true;
         }
     }
-    if (!running_streams_.empty()) {
+    if (!running_streams_.empty() && !enable_mixed_continuous_batching_) {
         return false;
     }
     if (cp_force_single_prefill_ && admitted_count > 0) {
         return false;
     }
     if (running_streams_.size() + admitted_count + 1 > max_generate_batch_size_) {
+        return false;
+    }
+    if (!fitsMixedKVCapacity(new_stream, &streams)) {
         return false;
     }
     size_t admitted_tokens         = 0;
@@ -188,8 +208,7 @@ bool FIFOScheduler::evaluateRunningBatch(const std::list<GenerateStreamPtr>& str
         admitted_count, admitted_tokens, admitted_max_seq_len, admitted_sequence_count, new_stream);
 }
 
-bool FIFOScheduler::evaluateRunningMemory(const list<GenerateStreamPtr>& streams,
-                                          const GenerateStreamPtr&       new_stream) {
+bool FIFOScheduler::evaluateRunningMemory(const list<GenerateStreamPtr>& streams, const GenerateStreamPtr& new_stream) {
     // FIFOScheduler's own scheduling loop uses the counter-based evaluateRunningBatch();
     // this list-based FIFOSchedulerBase entry point delegates to the list overload so
     // both paths agree.
@@ -207,9 +226,8 @@ bool FIFOScheduler::fitsPrefillTokenLimits(size_t                   admitted_str
         return true;
     }
 
-    // Preserve the existing one-token reserve for each already-running stream.
-    // Prefill is not mixed with a running batch, so this is normally zero, but
-    // keeping it here makes both callers retain the original boundary semantics.
+    // Reserve one query token for each already-running decode stream when
+    // mixed admission is enabled. In the default separated path this is zero.
     const auto running_token_reserve = running_streams_.size();
     if (running_token_reserve >= max_batch_tokens_size_) {
         return false;
@@ -233,6 +251,73 @@ bool FIFOScheduler::fitsPrefillTokenLimits(size_t                   admitted_str
     const auto sequence_count           = admitted_sequence_count + candidate_sequence_count;
     const auto max_seq_len              = std::max(admitted_max_seq_len, prefillSeqLenWithCache(candidate));
     return max_seq_len == 0 || sequence_count <= (available_tokens - 1) / max_seq_len;
+}
+
+bool FIFOScheduler::fitsMixedKVCapacity(const GenerateStreamPtr&            candidate,
+                                        const std::list<GenerateStreamPtr>* additionally_admitted) const {
+    if (!enable_mixed_continuous_batching_ || running_streams_.empty() || !cache_manager_) {
+        return true;
+    }
+
+    const int64_t available_blocks = static_cast<int64_t>(cache_manager_->availableBlocksNum());
+    const int64_t reserve_blocks   = static_cast<int64_t>(cache_manager_->reserveBlocksNum());
+
+    // A fresh prefill must fit above the allocator's reserve watermark. Later
+    // decode growth may consume the reserve, so the lifecycle check below uses
+    // all currently available blocks.
+    if (candidate->curBlocksNum() == 0) {
+        const int64_t initial_capacity = std::max<int64_t>(available_blocks - reserve_blocks, 0);
+        if (std::max(candidate->estimateInitialNeedBlocks(), 0) > initial_capacity) {
+            return false;
+        }
+    }
+
+    int64_t                                   outstanding_blocks = 0;
+    std::unordered_set<const GenerateStream*> seen;
+    const auto                                account_stream = [&](const GenerateStreamPtr& stream) {
+        if (!stream || stream->hasError() || stream->hasEvent(StreamEvents::GenerateDone)
+            || !seen.insert(stream.get()).second) {
+            return true;
+        }
+        const int64_t remaining_tokens = std::max<int64_t>(
+            static_cast<int64_t>(stream->maxTokenNum()) - static_cast<int64_t>(stream->seqLength()) - 1, 0);
+        const int clamped_remaining =
+            static_cast<int>(std::min<int64_t>(remaining_tokens, std::numeric_limits<int>::max()));
+        const int64_t stream_need = std::max(stream->estimatePeakNeedBlocks(clamped_remaining), 0);
+        if (stream_need > available_blocks - outstanding_blocks) {
+            return false;
+        }
+        outstanding_blocks += stream_need;
+        return true;
+    };
+    const auto account_list = [&](const std::list<GenerateStreamPtr>& streams) {
+        return std::all_of(streams.begin(), streams.end(), account_stream);
+    };
+
+    if (!account_list(running_streams_) || !account_list(new_streams_) || !account_list(loading_cache_streams_)) {
+        return false;
+    }
+    for (const auto& stream : waiting_streams_) {
+        if (stream.get() != candidate.get() && stream->curBlocksNum() > 0 && !account_stream(stream)) {
+            return false;
+        }
+    }
+    for (const auto& group : waiting_group_queue_) {
+        for (const auto& stream : group) {
+            if (stream.get() != candidate.get() && stream->curBlocksNum() > 0 && !account_stream(stream)) {
+                return false;
+            }
+        }
+    }
+    for (const auto& group : loading_cache_group_queue_) {
+        if (!account_list(group)) {
+            return false;
+        }
+    }
+    if (additionally_admitted && !account_list(*additionally_admitted)) {
+        return false;
+    }
+    return account_stream(candidate);
 }
 
 size_t FIFOScheduler::prefillTokenCostWithoutCache(const GenerateStreamPtr& stream) const {
@@ -310,13 +395,10 @@ void FIFOScheduler::admitWaitingStreams(list<GenerateStreamPtr>&       waiting_s
     last_admitted_context_token_size_ = 0;
     last_waiting_oldest_age_us_       = 0;
     if (!waiting_streams.empty()) {
-        auto oldest_enqueue_time_us = (*std::min_element(waiting_streams.begin(),
-                                                         waiting_streams.end(),
-                                                         [](const auto& lhs, const auto& rhs) {
-                                                             return lhs->schedulerEnqueueTimeUs()
-                                                                    < rhs->schedulerEnqueueTimeUs();
-                                                         }))
-                                          ->schedulerEnqueueTimeUs();
+        auto oldest_enqueue_time_us =
+            (*std::min_element(waiting_streams.begin(), waiting_streams.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs->schedulerEnqueueTimeUs() < rhs->schedulerEnqueueTimeUs();
+            }))->schedulerEnqueueTimeUs();
         last_waiting_oldest_age_us_ =
             std::max<int64_t>(0, autil::TimeUtility::currentTimeInMicroSeconds() - oldest_enqueue_time_us);
     }

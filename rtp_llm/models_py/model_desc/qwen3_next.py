@@ -12,7 +12,9 @@ from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, al
 from rtp_llm.models_py.model_desc.block_map import (
     get_group_tags_for_layers,
     get_primary_attention_inputs,
+    get_primary_attention_inputs_value,
     select_attention_inputs_for_layer,
+    select_attention_inputs_value_for_layer,
     select_fmha_impl_for_layer,
 )
 from rtp_llm.models_py.model_desc.generic_moe import GenericMoeLayer
@@ -111,6 +113,17 @@ class Qwen3NextMetadata(object):
     @property
     def is_cp_linear_attn(self) -> bool:
         return self.cp_restore_indices is not None
+
+
+class MixedAttentionInputs:
+    def __init__(
+        self,
+        decode: PyAttentionInputs,
+        context: PyAttentionInputs,
+    ) -> None:
+        self.decode = decode
+        self.context = context
+        self.decode_token_count = int(decode.sequence_lengths.numel())
 
 
 def _write_cp_cache_store(
@@ -952,13 +965,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         fmha_impl: FMHAImplBase,
         kv_cache: Optional[LayerKVCache],
-        attention_inputs: Optional[PyAttentionInputs],
+        attention_inputs: Optional[PyAttentionInputs | MixedAttentionInputs],
         attn_meta: Qwen3NextMetadata,
     ) -> torch.Tensor:
         assert attention_inputs is not None, "attention_inputs is required"
+        decode_attention_inputs = (
+            attention_inputs.decode
+            if isinstance(attention_inputs, MixedAttentionInputs)
+            else None
+        )
+        context_attention_inputs = (
+            attention_inputs.context
+            if isinstance(attention_inputs, MixedAttentionInputs)
+            else None
+        )
+        primary_attention_inputs = (
+            context_attention_inputs
+            if context_attention_inputs is not None
+            else attention_inputs
+        )
         assert (
-            attention_inputs.is_target_verify
-            or not attention_inputs.is_prefill
+            primary_attention_inputs.is_target_verify
+            or not primary_attention_inputs.is_prefill
             or attn_meta.get_prefill_conv1d_meta() is not None
             or attn_meta.is_cp_linear_attn
         ), "prefill_conv1d_meta is required for prefill"
@@ -966,7 +994,30 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         mixed_qkv, z, b, a = self.fix_query_key_value_ordering(
             projected_states_qkvz, projected_states_ba
         )
-        if attention_inputs.is_prefill and not attn_meta.is_target_verify:
+        if decode_attention_inputs is not None:
+            assert context_attention_inputs is not None
+            decode_token_count = int(decode_attention_inputs.sequence_lengths.numel())
+            assert 0 < decode_token_count < mixed_qkv.shape[0]
+            decode_slice = slice(0, decode_token_count)
+            context_slice = slice(decode_token_count, None)
+            decode_output = self.decode_gdn(
+                mixed_qkv[decode_slice],
+                b[decode_slice],
+                a[decode_slice],
+                decode_attention_inputs,
+                kv_cache,
+                attn_meta,
+            )
+            context_output = self.prefill_gdn(
+                mixed_qkv[context_slice],
+                b[context_slice],
+                a[context_slice],
+                context_attention_inputs,
+                kv_cache,
+                attn_meta,
+            )
+            attn_output = torch.cat((decode_output, context_output), dim=0)
+        elif attention_inputs.is_prefill and not attn_meta.is_target_verify:
             if attn_meta.is_cp_linear_attn:
                 return self._forward_cp_prefill(
                     mixed_qkv, z, b, a, attention_inputs, kv_cache, attn_meta
@@ -1204,7 +1255,17 @@ class Qwen3NextModel(GptModelBase):
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         hidden_states = self.word_embedding(inputs)
 
-        attention_inputs = get_primary_attention_inputs(inputs, self.kv_cache)
+        decode_attention_inputs = get_primary_attention_inputs(inputs, self.kv_cache)
+        mixed_context_attention_inputs = (
+            inputs.mixed_context_attention_inputs
+            if getattr(inputs, "is_mixed_batch", False)
+            else None
+        )
+        attention_inputs = (
+            get_primary_attention_inputs_value(mixed_context_attention_inputs)
+            if mixed_context_attention_inputs is not None
+            else decode_attention_inputs
+        )
         prefill_conv1d_meta = None
         is_target_verify = attention_inputs.is_target_verify
         is_cp = self.parallelism_config.prefill_cp_config.is_enabled()
@@ -1251,6 +1312,21 @@ class Qwen3NextModel(GptModelBase):
             layer_attention_inputs = select_attention_inputs_for_layer(
                 inputs, self.kv_cache, i
             )
+            if mixed_context_attention_inputs is not None:
+                context_layer_attention_inputs = (
+                    select_attention_inputs_value_for_layer(
+                        mixed_context_attention_inputs, self.kv_cache, i
+                    )
+                )
+                if isinstance(layer_attention_inputs, list) or isinstance(
+                    context_layer_attention_inputs, list
+                ):
+                    raise RuntimeError(
+                        "mixed Qwen3Next layers require one KV-cache group per layer"
+                    )
+                layer_attention_inputs = MixedAttentionInputs(
+                    layer_attention_inputs, context_layer_attention_inputs
+                )
             layer_fmha_impl = (
                 None
                 if decoder_layer.layer_type == HybridAttentionType.LINEAR

@@ -189,8 +189,6 @@ struct KVCacheConfig {
     bool    enable_independent_group_eviction       = false;
     int64_t device_cache_min_free_blocks            = 0;
     int     load_cache_retry_times                  = 1;  // Maximum retry attempts for load cache transfer failures
-
-
     // DSV4 fixed-allocation pool block count. 0 means the fixed regions
     // (INDEXER_STATE / CSA_STATE / HCA_STATE / SWA_KV) use the normal
     // linear-step-derived block count.
@@ -385,6 +383,11 @@ PDFusionSchedulerMode parsePDFusionSchedulerMode(const std::string& mode);
 struct FIFOSchedulerConfig {
     int64_t max_context_batch_size = 1;
     int64_t max_batch_tokens_size  = 0;
+    // Allow the unified PDFUSION FIFO scheduler to admit context streams into
+    // a running decode batch. Python-backed models keep one combined model
+    // forward and dispatch decode/prefill only at their native attention
+    // boundaries. Pure decode rounds retain their CUDA graph fast path.
+    bool enable_mixed_continuous_batching = false;
     // PDFUSION scheduler mode. Supported values:
     //   ""      -> default FIFO/decode-first scheduler
     //   "ratio" -> PDFusionRatioScheduler with decode_prefill_ratio

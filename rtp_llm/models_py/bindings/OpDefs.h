@@ -359,8 +359,20 @@ struct PyModelInputs {
     AttentionInputsByTag attention_inputs_by_tag;
     BertEmbeddingInputs  bert_embedding_inputs;
 
+    // Mixed continuous batches keep decode metadata in attention_inputs and
+    // carry the context metadata separately. Python model layers can then run
+    // projections/MLP on the combined token matrix while dispatching the two
+    // attention kernels with their native layouts.
+    bool                 is_mixed_batch{false};
+    PyAttentionInputs    mixed_context_attention_inputs;
+    AttentionInputsByTag mixed_context_attention_inputs_by_tag;
+
     bool hasAttentionInputsByTag() const {
         return !attention_inputs_by_tag.empty();
+    }
+
+    bool hasMixedContextAttentionInputsByTag() const {
+        return !mixed_context_attention_inputs_by_tag.empty();
     }
 };
 

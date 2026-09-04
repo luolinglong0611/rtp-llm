@@ -9,10 +9,12 @@ from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.model_desc.block_map import (
     get_attention_inputs_value,
+    get_primary_attention_inputs_value,
     select_attention_inputs_for_tag,
 )
 from rtp_llm.models_py.modules import AttnImplFactory
 from rtp_llm.models_py.modules.factory.attention.attn_factory import AttentionImpl
+from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import MixedFMHAImpl
 from rtp_llm.ops import DeviceResourceConfig
 from rtp_llm.ops.compute_ops import (
     KVCache,
@@ -78,6 +80,41 @@ class GptModelBase(nn.Module):
         self, inputs: PyModelInputs, is_cuda_graph: bool = False
     ) -> AttentionImpl | dict[str, AttentionImpl]:
         attention_inputs = get_attention_inputs_value(inputs)
+        decode_impl = self._prepare_fmha_impl_for_inputs(
+            attention_inputs, is_cuda_graph
+        )
+        if not getattr(inputs, "is_mixed_batch", False):
+            return decode_impl
+
+        context_attention_inputs = inputs.mixed_context_attention_inputs
+        context_impl = self._prepare_fmha_impl_for_inputs(
+            context_attention_inputs, is_cuda_graph=False
+        )
+        decode_token_count = int(
+            get_primary_attention_inputs_value(
+                attention_inputs
+            ).sequence_lengths.numel()
+        )
+        if isinstance(decode_impl, Mapping):
+            if not isinstance(context_impl, Mapping) or set(decode_impl) != set(
+                context_impl
+            ):
+                raise RuntimeError(
+                    "mixed decode/context FMHA groups must have identical tags"
+                )
+            return {
+                tag: MixedFMHAImpl(
+                    decode_impl[tag], context_impl[tag], decode_token_count
+                )
+                for tag in decode_impl
+            }
+        if isinstance(context_impl, Mapping):
+            raise RuntimeError("mixed decode/context FMHA group layouts do not match")
+        return MixedFMHAImpl(decode_impl, context_impl, decode_token_count)
+
+    def _prepare_fmha_impl_for_inputs(
+        self, attention_inputs, is_cuda_graph: bool
+    ) -> AttentionImpl | dict[str, AttentionImpl]:
         if isinstance(attention_inputs, Mapping):
             fmha_group_tags = self._get_fmha_group_tags()
             selected_group_inputs = (

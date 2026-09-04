@@ -176,3 +176,54 @@ class FMHAImplBase(ABC):
 
     # def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
     #     pass
+
+
+class MixedFMHAImpl(FMHAImplBase):
+    """Run native decode and prefill attention on slices of one projected batch."""
+
+    def __init__(
+        self,
+        decode_impl: FMHAImplBase,
+        context_impl: FMHAImplBase,
+        decode_token_count: int,
+    ) -> None:
+        if decode_token_count <= 0:
+            raise ValueError("decode_token_count must be positive for mixed attention")
+        self.decode_impl = decode_impl
+        self.context_impl = context_impl
+        self.decode_token_count = decode_token_count
+
+    @staticmethod
+    def support(attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs) -> bool:
+        return False
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        if qkv.ndim == 0 or qkv.shape[0] <= self.decode_token_count:
+            raise ValueError(
+                "mixed attention requires both decode and context tokens: "
+                f"tokens={qkv.shape[0] if qkv.ndim else 0}, "
+                f"decode={self.decode_token_count}"
+            )
+        decode_qkv = qkv.narrow(0, 0, self.decode_token_count)
+        context_qkv = qkv.narrow(
+            0, self.decode_token_count, qkv.shape[0] - self.decode_token_count
+        )
+        decode_output = self.decode_impl.forward(decode_qkv, kv_cache, layer_idx)
+        context_output = self.context_impl.forward(context_qkv, kv_cache, layer_idx)
+        # Native decode kernels commonly return [tokens, hidden], while native
+        # prefill kernels return [tokens, heads, head_dim]. CausalAttention
+        # accepts either for a pure batch and flattens it after this call. Do
+        # that normalization per slice before restoring the packed token order.
+        decode_output = decode_output.reshape(decode_qkv.shape[0], -1)
+        context_output = context_output.reshape(context_qkv.shape[0], -1)
+        if decode_output.shape[1] != context_output.shape[1]:
+            raise ValueError(
+                "mixed attention output widths differ: "
+                f"decode={decode_output.shape[1]}, context={context_output.shape[1]}"
+            )
+        return torch.cat((decode_output, context_output), dim=0)

@@ -13,6 +13,7 @@ from rtp_llm.models_py.model_desc.qwen3_next import (
     _maybe_write_cp_cache_store,
     _write_cp_cache_store,
 )
+from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import MixedFMHAImpl
 
 
 class FakeKVCache:
@@ -159,6 +160,59 @@ class AttentionInputRoutingTest(unittest.TestCase):
 
         self.assertEqual(fmha_impl, inputs_by_tag)
         self.assertEqual(factory.call_count, 2)
+
+    def test_prepare_mixed_fmha_pairs_decode_and_context_by_tag(self):
+        decode_inputs = {"full": SimpleNamespace(sequence_lengths=torch.tensor([7, 8]))}
+        context_inputs = {
+            "full": SimpleNamespace(sequence_lengths=torch.empty(0, dtype=torch.int32))
+        }
+        inputs = SimpleNamespace(
+            attention_inputs=decode_inputs,
+            is_mixed_batch=True,
+            mixed_context_attention_inputs=context_inputs,
+        )
+        model = RoutingModel(["full"])
+
+        with patch(
+            "rtp_llm.models_py.model_desc.module_base.AttnImplFactory.get_fmha_impl",
+            side_effect=lambda _config, _parallelism_config, _weight, group_inputs, _fmha_config, _is_cuda_graph: (
+                SimpleNamespace(source=group_inputs)
+            ),
+        ) as factory:
+            mixed = model.prepare_fmha_impl(inputs)
+
+        self.assertEqual(factory.call_count, 2)
+        self.assertIsInstance(mixed["full"], MixedFMHAImpl)
+        self.assertIs(mixed["full"].decode_impl.source, decode_inputs["full"])
+        self.assertIs(mixed["full"].context_impl.source, context_inputs["full"])
+        self.assertEqual(mixed["full"].decode_token_count, 2)
+
+    def test_mixed_fmha_splits_attention_only_and_restores_token_order(self):
+        class FakeImpl:
+            def __init__(self, offset: int, return_heads: bool = False) -> None:
+                self.offset = offset
+                self.return_heads = return_heads
+                self.calls: list[tuple[torch.Tensor, object, int]] = []
+
+            def forward(self, qkv, kv_cache, layer_idx=0):
+                self.calls.append((qkv, kv_cache, layer_idx))
+                output = qkv + self.offset
+                return output.unsqueeze(1) if self.return_heads else output
+
+        decode_impl = FakeImpl(10)
+        context_impl = FakeImpl(100, return_heads=True)
+        mixed = MixedFMHAImpl(decode_impl, context_impl, decode_token_count=2)
+        qkv = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+        kv_cache = object()
+
+        output = mixed.forward(qkv, kv_cache, layer_idx=3)
+
+        self.assertTrue(torch.equal(output[:2], qkv[:2] + 10))
+        self.assertTrue(torch.equal(output[2:], qkv[2:] + 100))
+        self.assertEqual(decode_impl.calls[0][0].shape, (2, 2))
+        self.assertEqual(context_impl.calls[0][0].shape, (3, 2))
+        self.assertIs(decode_impl.calls[0][1], kv_cache)
+        self.assertEqual(context_impl.calls[0][2], 3)
 
 
 if __name__ == "__main__":
