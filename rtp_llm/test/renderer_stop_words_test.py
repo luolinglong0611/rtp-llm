@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, Mock
 
 import torch
 
+from rtp_llm.config.py_config_modules import GenerateEnvConfig
 from rtp_llm.openai.api_datatype import (
     ChatCompletionRequest,
     ChatMessage,
@@ -18,7 +19,6 @@ from rtp_llm.openai.renderers.custom_renderer import (
 from rtp_llm.openai.renderers.reasoning_tool_base_renderer import (
     ReasoningToolBaseRenderer,
 )
-from rtp_llm.config.py_config_modules import GenerateEnvConfig
 from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput
 from rtp_llm.utils.word_util import get_stop_word_slices
 
@@ -155,6 +155,54 @@ class RemoveStopWordIdsTest(TestCase):
         output_ids = [100, 300, 301, 102]
         result = self.renderer._remove_stop_word_ids(output_ids, [])
         self.assertEqual(result, [100])
+
+    def test_ignore_eos_keeps_eos_tokens(self):
+        output_ids = [100, 2, 101]
+        result = self.renderer._remove_stop_word_ids(
+            output_ids, [], ignore_eos=True, stop_word_ids_list=[]
+        )
+        self.assertEqual(result, output_ids)
+
+    def test_request_stop_words_override_renderer_defaults(self):
+        output_ids = [100, 151643, 101]
+        result = self.renderer._remove_stop_word_ids(
+            output_ids, [], stop_word_ids_list=[]
+        )
+        self.assertEqual(result, output_ids)
+
+
+class FinishReasonTest(TestCase):
+    def setUp(self):
+        self.renderer = Mock(spec=CustomChatRenderer)
+        self.renderer.max_seq_len = 1024
+        self.renderer.eos_token_id = 2
+        self.renderer.stop_words_id_list = [[151643]]
+        self.renderer.get_all_extra_stop_word_ids_list = Mock(return_value=[])
+        self.renderer._check_finish_reason = (
+            CustomChatRenderer._check_finish_reason.__get__(self.renderer)
+        )
+
+    def test_ignore_eos_uses_request_resolved_stop_words(self):
+        self.assertIsNone(
+            self.renderer._check_finish_reason(
+                [100, 2],
+                input_token_length=0,
+                ignore_eos=True,
+                stop_word_ids_list=[],
+            )
+        )
+
+    def test_max_length_wins_when_eos_is_ignored(self):
+        self.assertEqual(
+            self.renderer._check_finish_reason(
+                [100, 2],
+                input_token_length=0,
+                max_new_tokens=2,
+                ignore_eos=True,
+                stop_word_ids_list=[],
+            ),
+            FinisheReason.length,
+        )
 
 
 class ProcessStopWordsTest(TestCase):

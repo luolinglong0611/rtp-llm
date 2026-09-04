@@ -432,6 +432,8 @@ class QwenRenderer(CustomChatRenderer):
         stop_words_str: List[str],
         stop_word_slice_list: List[str],
         is_streaming: bool,
+        ignore_eos: bool = False,
+        stop_word_ids_list: Optional[List[List[int]]] = None,
     ) -> OutputDelta:
         if status.request.tools or self.in_think_mode(status.request):
             return await self.qwen_reasoning_tool_renderer._update_single_status(
@@ -441,6 +443,8 @@ class QwenRenderer(CustomChatRenderer):
                 stop_words_str,
                 stop_word_slice_list,
                 is_streaming,
+                ignore_eos,
+                stop_word_ids_list,
             )
 
         if not isinstance(status, QwenStreamStatus):
@@ -456,8 +460,17 @@ class QwenRenderer(CustomChatRenderer):
             return await self._create_empty_delta(status.output.aux_info)
         status.update_output(
             output,
-            functools.partial(self._check_finish_reason, max_new_tokens=max_new_tokens),
-            self._remove_stop_word_ids,
+            functools.partial(
+                self._check_finish_reason,
+                max_new_tokens=max_new_tokens,
+                ignore_eos=ignore_eos,
+                stop_word_ids_list=stop_word_ids_list,
+            ),
+            functools.partial(
+                self._remove_stop_word_ids,
+                ignore_eos=ignore_eos,
+                stop_word_ids_list=stop_word_ids_list,
+            ),
         )
         status.total_output_string = self.tokenizer.decode(status.output_ids).strip()
         if (len(status.total_output_string)) and (

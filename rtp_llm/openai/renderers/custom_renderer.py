@@ -756,13 +756,24 @@ class CustomChatRenderer:
         stop_words_str: List[str],
         stop_word_slice_list: List[str],
         is_streaming: bool,
+        ignore_eos: bool = False,
+        stop_word_ids_list: Optional[List[List[int]]] = None,
     ) -> OutputDelta:
         if status.finish_reason != None:
             return await self._create_empty_delta(status.output.aux_info)
         status.update_output(
             output,
-            functools.partial(self._check_finish_reason, max_new_tokens=max_new_tokens),
-            self._remove_stop_word_ids,
+            functools.partial(
+                self._check_finish_reason,
+                max_new_tokens=max_new_tokens,
+                ignore_eos=ignore_eos,
+                stop_word_ids_list=stop_word_ids_list,
+            ),
+            functools.partial(
+                self._remove_stop_word_ids,
+                ignore_eos=ignore_eos,
+                stop_word_ids_list=stop_word_ids_list,
+            ),
         )
         decoded_prev_token = self.tokenizer.decode(status.prev_token_id)
         decoded_string = self.tokenizer.decode(status.tokens_to_decode)
@@ -1185,6 +1196,8 @@ class CustomChatRenderer:
                         generate_config.stop_words_str,
                         stop_word_slice_list,
                         generate_config.is_streaming,
+                        generate_config.ignore_eos,
+                        generate_config.stop_words_list,
                     )
                     if delta.extra_outputs is None:
                         delta.extra_outputs = await self._generate_extra_outputs(
@@ -1733,18 +1746,25 @@ class CustomChatRenderer:
         return chat_response.model_dump_json(exclude_none=True)
 
     def _check_finish_reason(
-        self, token_ids: List[int], input_token_length: int, max_new_tokens: int = -1
+        self,
+        token_ids: List[int],
+        input_token_length: int,
+        max_new_tokens: int = -1,
+        ignore_eos: bool = False,
+        stop_word_ids_list: Optional[List[List[int]]] = None,
     ) -> Optional[FinisheReason]:
-        stop_word_ids_list_all = (
+        resolved_stop_word_ids_list = (
             self.get_all_extra_stop_word_ids_list() + self.stop_words_id_list
+            if stop_word_ids_list is None
+            else stop_word_ids_list
         )
         if max_new_tokens > 0 and len(token_ids) >= max_new_tokens:
             return FinisheReason.length
         if len(token_ids) + input_token_length >= self.max_seq_len:
             return FinisheReason.length
-        if token_ids and token_ids[-1] == self.eos_token_id:
+        if not ignore_eos and token_ids and token_ids[-1] == self.eos_token_id:
             return FinisheReason.stop
-        for stop_word_ids in stop_word_ids_list_all:
+        for stop_word_ids in resolved_stop_word_ids_list:
             if (len(token_ids) >= len(stop_word_ids)) and (
                 token_ids[-len(stop_word_ids) :] == stop_word_ids
             ):
@@ -1752,7 +1772,11 @@ class CustomChatRenderer:
         return None
 
     def _remove_stop_word_ids(
-        self, output_ids: List[int], delta_output_ids: List[int]
+        self,
+        output_ids: List[int],
+        delta_output_ids: List[int],
+        ignore_eos: bool = False,
+        stop_word_ids_list: Optional[List[List[int]]] = None,
     ) -> List[int]:
         """
         Truncate token sequence at FIRST occurrence of stop word (eos or stop_word_ids).
@@ -1782,20 +1806,22 @@ class CustomChatRenderer:
             String-level truncation is still needed after this (see _process_stop_words)
             because stop words may span multiple tokens or appear mid-token.
         """
-        stop_word_ids_list_all = (
+        resolved_stop_word_ids_list = (
             self.get_all_extra_stop_word_ids_list() + self.stop_words_id_list
+            if stop_word_ids_list is None
+            else stop_word_ids_list
         )
 
         # Find earliest position of any stop token (EOS or stop word sequence)
         min_stop_pos = len(output_ids)
 
         # Check for eos token position
-        if self.eos_token_id in output_ids:
+        if not ignore_eos and self.eos_token_id in output_ids:
             eos_pos = output_ids.index(self.eos_token_id)
             min_stop_pos = min(min_stop_pos, eos_pos)
 
         # Check for stop word sequences - find first occurrence of each
-        for stop_word_ids in stop_word_ids_list_all:
+        for stop_word_ids in resolved_stop_word_ids_list:
             if not stop_word_ids:
                 continue
             stop_len = len(stop_word_ids)
