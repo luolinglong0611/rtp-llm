@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Callable
 
 import torch
@@ -263,6 +264,7 @@ class Qwen3_5MoeVisionAttention(nn.Module):
         self.config = config
         self.attention_dropout = 0.0
         self.is_causal = False
+        self.batched_sdpa = os.environ.get("QWEN35_VIT_BATCHED_SDPA", "0") == "1"
 
     def forward(
         self,
@@ -311,10 +313,39 @@ class Qwen3_5MoeVisionAttention(nn.Module):
                 **kwargs,
             )
         else:
-            # Other implementations: Process each chunk separately
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            if (
+                self.batched_sdpa
+                and self.config._attn_implementation == "sdpa"
+                and len(lengths) > 1
+                and lengths[0] > 0
+                and all(length == lengths[0] for length in lengths)
+            ):
+                # Frames remain independent batch elements, not one longer
+                # attention sequence. The uniform-video path avoids launching
+                # one SDPA call per temporal slice while preserving frame order.
+                frames = [
+                    tensor.reshape(
+                        self.num_heads, len(lengths), lengths[0], self.head_dim
+                    ).transpose(0, 1)
+                    for tensor in (query_states, key_states, value_states)
+                ]
+                attn_output, _ = attention_interface(
+                    self,
+                    *frames,
+                    attention_mask=None,
+                    scaling=self.scaling,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    is_causal=False,
+                    **kwargs,
+                )
+                attn_output = attn_output.reshape(seq_length, -1).contiguous()
+                return self.proj(attn_output)
+
+            # Variable spatial extents and other implementations keep the
+            # independent per-frame path. Copy lengths to CPU only once.
             splits = [
-                torch.split(tensor, lengths.tolist(), dim=2)
+                torch.split(tensor, lengths, dim=2)
                 for tensor in (query_states, key_states, value_states)
             ]
 

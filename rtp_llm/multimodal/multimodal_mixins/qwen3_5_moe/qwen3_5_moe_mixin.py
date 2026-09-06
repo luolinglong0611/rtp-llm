@@ -92,7 +92,21 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
     def batched_embedding(
         self, data_list: List[Any], mm_types: List[MMUrlType], **kwargs
     ):
-        if not all(mm_type == MMUrlType.IMAGE for mm_type in mm_types):
+        if len(data_list) != len(mm_types):
+            raise ValueError("data_list and mm_types must have the same length")
+        if not data_list:
+            return []
+        if len(data_list) == 1:
+            # Preserve the serial path (and avoid a CPU concat copy) with the
+            # default VIT_GPU_MAX_BATCH_SIZE=1, including for long videos.
+            return [self.embedding(data_list[0], mm_type=mm_types[0], **kwargs)]
+        # Both preprocessors produce (patches, grid_thw), with one grid row per
+        # media item. The vision model separates attention by frame through
+        # cu_seqlens; concatenating videos must not mix their position IDs or
+        # features. Temporal extent is retained in grid_thw and split_sizes.
+        if not all(
+            mm_type in (MMUrlType.IMAGE, MMUrlType.VIDEO) for mm_type in mm_types
+        ):
             return super().batched_embedding(data_list, mm_types, **kwargs)
         res_list = []
         pixel_values_list = []
