@@ -52,6 +52,10 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
         # RTP, matching the Qwen3.5-vLLM baseline's do_sample_frames=False.
         if hasattr(self.mm_processor, "video_processor"):
             self.mm_processor.video_processor.do_sample_frames = False
+            self.mm_processor.video_processor.size = {
+                "longest_edge": 36864000,
+                "shortest_edge": 2500000,
+            }
         self.mm_processor.image_processor = Qwen2VLImageProcessor.from_pretrained(
             mm_related_params.config["ckpt_path"]
         )
@@ -60,6 +64,25 @@ class Qwen3_5MoeImageEmbedding(Qwen3_VLImageEmbedding):
         )
         config_hf._attn_implementation = default_attn_impl
         self.visual = Qwen3_5MoeVisionModel._from_config(config_hf)
+
+    @staticmethod
+    def load_video(data, configs, **kwargs):
+        # Resolve only missing video settings, without mutating the request (or
+        # its cache key). Image defaults and explicit request overrides are kept.
+        video_config = MMPreprocessConfig(
+            width=configs.width,
+            height=configs.height,
+            min_pixels=3136 if configs.min_pixels == -1 else configs.min_pixels,
+            max_pixels=4194304 if configs.max_pixels == -1 else configs.max_pixels,
+            fps=6 if configs.fps == -1 else configs.fps,
+            min_frames=configs.min_frames,
+            max_frames=90 if configs.max_frames == -1 else configs.max_frames,
+            crop_positions=configs.crop_positions,
+            mm_timeout_ms=configs.mm_timeout_ms,
+        )
+        return Qwen3_VLImageEmbedding.load_video(
+            data, video_config, apply_video_pixel_budget=False, **kwargs
+        )
 
     @property
     def _data_type(self):

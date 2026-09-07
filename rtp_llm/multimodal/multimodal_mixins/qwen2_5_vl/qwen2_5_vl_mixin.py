@@ -32,6 +32,9 @@ import torch
 import torch.library as tl
 import torch.nn as nn
 from PIL import Image
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+
 from rtp_llm.model_loader.model_weight_info import ModelWeightInfo
 from rtp_llm.model_loader.weight_module import CustomAtomicWeight
 from rtp_llm.multimodal.multimodal_mixin_register import register_multimodal_mixin
@@ -62,8 +65,6 @@ from rtp_llm.multimodal.vit_metrics import (
 )
 from rtp_llm.utils.model_weight import CkptWeightInfo, identity, sp_id
 from rtp_llm.utils.swizzle_utils import swizzle_tensor
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
 
 if not hasattr(tl, "wrap_triton"):
 
@@ -158,7 +159,7 @@ class Qwen2_5_VLImageEmbedding(Qwen2_VLImageEmbedding):
         return self.visual.get_device()
 
     @staticmethod
-    def load_video(data, configs, **kwargs):
+    def load_video(data, configs, apply_video_pixel_budget: bool = True, **kwargs):
         vit_metrics_tags: Optional[Dict[str, str]] = kwargs.get("vit_metrics_tags")
         decode_timer = (
             vit_preprocess_timer(
@@ -188,15 +189,23 @@ class Qwen2_5_VLImageEmbedding(Qwen2_VLImageEmbedding):
         min_pixels = (
             configs.min_pixels if configs.min_pixels != -1 else VIDEO_MIN_PIXELS
         )
-        total_pixels = VIDEO_TOTAL_PIXELS
-        max_pixels = max(
-            min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
-            int(min_pixels * 1.05),
-        )
-        max_pixels_supposed = (
-            configs.max_pixels if configs.max_pixels != -1 else max_pixels
-        )
-        max_pixels = min(max_pixels_supposed, max_pixels)
+        if apply_video_pixel_budget:
+            total_pixels = VIDEO_TOTAL_PIXELS
+            max_pixels = max(
+                min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR),
+                int(min_pixels * 1.05),
+            )
+            max_pixels_supposed = (
+                configs.max_pixels if configs.max_pixels != -1 else max_pixels
+            )
+            max_pixels = min(max_pixels_supposed, max_pixels)
+        else:
+            # Qwen3.5 supplies its own media-I/O pixel range. Its video processor
+            # applies the final size budget; do not silently clamp it with the
+            # older Qwen2.5 per-frame / total-video budget first.
+            max_pixels = (
+                configs.max_pixels if configs.max_pixels != -1 else VIDEO_MAX_PIXELS
+            )
         if configs.height != -1 and configs.width != -1:
             resized_height, resized_width = smart_resize(
                 configs.height,

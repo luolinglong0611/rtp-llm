@@ -72,8 +72,9 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
     def _device(self):
         return self.visual.device
 
-    @staticmethod
+    @classmethod
     def preprocess_input(
+        cls,
         mm_inputs: List[MultimodalInput],
         vit_config: VitConfig,
         processor,
@@ -159,7 +160,7 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
                     vit_config.download_headers,
                     max_file_size_kb=vit_config.mm_video_max_file_size_kb,
                 )
-            video = Qwen3_VLImageEmbedding.load_video(
+            video = cls.load_video(
                 video_data,
                 mm_input.mm_preprocess_config,
                 vit_metrics_tags=tags,
