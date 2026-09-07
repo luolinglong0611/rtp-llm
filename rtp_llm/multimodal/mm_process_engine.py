@@ -148,6 +148,45 @@ class LocalPreprocessExecutor(PreprocessExecutor):
             raise
 
 
+class _PreprocessPoolGeneration:
+    """Results belong to one pool, including when that pool loses a worker.
+
+    Pool callbacks must not acquire the executor's lifecycle lock: terminate()
+    joins the result-handler thread while the rebuilding caller holds that lock.
+    """
+
+    def __init__(self, number: int):
+        self.number = number
+        self._lock = threading.Lock()
+        self._pending = set()
+
+    def new_result(self) -> concurrent.futures.Future:
+        future = concurrent.futures.Future()
+        with self._lock:
+            self._pending.add(future)
+        return future
+
+    def complete(self, future, result=None, error=None) -> None:
+        with self._lock:
+            if future not in self._pending:
+                return
+            self._pending.remove(future)
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(result)
+
+    def invalidate(self, reason: str) -> None:
+        with self._lock:
+            for future in self._pending:
+                future.set_exception(
+                    RuntimeError(
+                        f"Preprocessing pool generation {self.number} {reason}"
+                    )
+                )
+            self._pending.clear()
+
+
 class MultiprocessPreprocessExecutor(PreprocessExecutor):
     """多进程预处理执行器
 
@@ -173,10 +212,10 @@ class MultiprocessPreprocessExecutor(PreprocessExecutor):
         self.pool: Optional[multiprocessing.pool.Pool] = None
         self._consecutive_timeouts = 0
         self._max_consecutive_timeouts = vit_config.mm_preprocess_max_workers
-        # Serializes timeout-counter updates and pool rebuilds — without it
-        # concurrent get_result/submit callers can race to _rebuild_pool, double
-        # tear down the pool, or miscount consecutive timeouts.
-        self._pool_lock = threading.Lock()
+        # Include normal submissions and shutdown, not just recovery paths.
+        self._pool_lock = threading.RLock()
+        self._generation = _PreprocessPoolGeneration(0)
+        self._closed = False
         self._create_pool()
 
     def _create_pool(self) -> None:
@@ -200,38 +239,57 @@ class MultiprocessPreprocessExecutor(PreprocessExecutor):
         Called when a worker dies / the pool's manager pipes are broken — without this
         the pool stays in a permanently-unusable state and every subsequent submit fails.
         """
-        old = self.pool
-        self.pool = None
+        with self._pool_lock:
+            if self._closed:
+                raise RuntimeError("Preprocessing executor is shut down")
+            old = self.pool
+            self.pool = None
+            # A terminated Pool can silently abandon its AsyncResults forever.
+            # Wake those callers now; their failures must not rebuild the new pool.
+            self._generation.invalidate("was replaced")
+            self._generation = _PreprocessPoolGeneration(self._generation.number + 1)
+            self._consecutive_timeouts = 0
+            try:
+                if old is not None:
+                    old.terminate()
+                    old.join()
+            except Exception as e:
+                logging.warning(f"terminate broken pool failed: {e}")
+            self._create_pool()
+
+    def _submit_locked(self, work_item: "MMWorkItem") -> None:
+        generation = self._generation
+        future = generation.new_result()
+        work_item.future = future
+        work_item.preprocess_pool_generation = generation
         try:
-            if old is not None:
-                old.terminate()
-                old.join()
-        except Exception as e:
-            logging.warning(f"terminate broken pool failed: {e}")
-        self._create_pool()
+            self.pool.apply_async(
+                _worker_process_task,
+                args=(work_item.mm_inputs,),
+                callback=lambda result: generation.complete(future, result=result),
+                error_callback=lambda error: generation.complete(future, error=error),
+            )
+        except Exception as error:
+            generation.complete(future, error=error)
+            raise
 
     def submit(self, work_item: "MMWorkItem") -> None:
         if work_item.embedding_result is not None:
             return
 
-        try:
-            work_item.future = self.pool.apply_async(
-                _worker_process_task, args=(work_item.mm_inputs,)
-            )
-            return
-        except (BrokenPipeError, OSError, EOFError) as e:
-            # multiprocessing.Pool surfaces broken state via these — rebuild and retry once.
-            # Keep both rebuild and the retry submission under _pool_lock so another thread
-            # cannot tear self.pool down between our rebuild and the apply_async call.
-            logging.error(f"Pool broken on submit, rebuilding: {e}", exc_info=True)
-            with self._pool_lock:
+        with self._pool_lock:
+            if self._closed:
+                raise RuntimeError("Preprocessing executor is shut down")
+            # A previous pool construction may have failed. Retry lazily without
+            # leaving the executor permanently stuck with pool=None.
+            if self.pool is None:
+                self._create_pool()
+            try:
+                self._submit_locked(work_item)
+            except (BrokenPipeError, OSError, EOFError) as e:
+                logging.error(f"Pool broken on submit, rebuilding: {e}", exc_info=True)
                 self._rebuild_pool()
-                work_item.future = self.pool.apply_async(
-                    _worker_process_task, args=(work_item.mm_inputs,)
-                )
-        except Exception as e:
-            logging.error(f"Unexpected error during submission: {e}", exc_info=True)
-            raise
+                self._submit_locked(work_item)
 
     def get_result(self, work_item: "MMWorkItem") -> None:
         if work_item.future is None:
@@ -239,35 +297,55 @@ class MultiprocessPreprocessExecutor(PreprocessExecutor):
                 raise ValueError("Embedding result and future cannot both be None")
             return
 
-        try:
-            work_item.preprocess_result, preprocess_time, samples = (
-                work_item.future.get(timeout=work_item.mm_timeout_ms / 1000.0)
-            )
-            with self._pool_lock:
-                self._consecutive_timeouts = 0
-            kmonitor.report(GaugeMetrics.VIT_PREPROCESS_RT_METRIC, preprocess_time)
-            _report_vit_preprocess_samples(samples)
-        except multiprocessing.pool.TimeoutError:
-            with self._pool_lock:
-                self._consecutive_timeouts += 1
-                if self._consecutive_timeouts >= self._max_consecutive_timeouts:
-                    logging.warning(
-                        f"Hit {self._consecutive_timeouts} consecutive timeouts, "
-                        f"rebuilding pool (workers may be stuck)"
-                    )
-                    self._rebuild_pool()
-                    self._consecutive_timeouts = 0
-            raise TimeoutError(
+        generation = work_item.preprocess_pool_generation
+        # Distinguish the wait deadline from a TimeoutError raised by the user's
+        # preprocessing function (Future.result(timeout=...) conflates the two).
+        done, _ = concurrent.futures.wait(
+            [work_item.future], timeout=work_item.mm_timeout_ms / 1000.0
+        )
+        if not done:
+            error = TimeoutError(
                 f"Preprocessing timeout after {work_item.mm_timeout_ms}ms"
             )
-        except (BrokenPipeError, OSError, EOFError) as e:
-            # worker died mid-task → pool is broken; rebuild so subsequent submits work
-            logging.error(f"Pool broken on get_result, rebuilding: {e}", exc_info=True)
+            generation.complete(work_item.future, error=error)
             with self._pool_lock:
-                try:
-                    self._rebuild_pool()
-                except Exception as rb:
-                    logging.error(f"pool rebuild failed: {rb}", exc_info=True)
+                if generation is self._generation and not self._closed:
+                    self._consecutive_timeouts += 1
+                    if self._consecutive_timeouts >= self._max_consecutive_timeouts:
+                        logging.warning(
+                            f"Hit {self._consecutive_timeouts} consecutive timeouts, "
+                            f"rebuilding pool generation {generation.number} "
+                            f"(workers may be stuck)"
+                        )
+                        try:
+                            self._rebuild_pool()
+                        except Exception:
+                            logging.exception("pool rebuild failed after timeout")
+            raise error
+
+        try:
+            work_item.preprocess_result, preprocess_time, samples = (
+                work_item.future.result()
+            )
+            with self._pool_lock:
+                if generation is self._generation and not self._closed:
+                    self._consecutive_timeouts = 0
+            kmonitor.report(GaugeMetrics.VIT_PREPROCESS_RT_METRIC, preprocess_time)
+            _report_vit_preprocess_samples(samples)
+        except (TimeoutError, multiprocessing.pool.TimeoutError):
+            # An application timeout is not evidence that the pool is broken.
+            raise
+        except (BrokenPipeError, OSError, EOFError) as e:
+            with self._pool_lock:
+                if generation is self._generation and not self._closed:
+                    logging.error(
+                        f"Pool generation {generation.number} broken on get_result, rebuilding: {e}",
+                        exc_info=True,
+                    )
+                    try:
+                        self._rebuild_pool()
+                    except Exception as rb:
+                        logging.error(f"pool rebuild failed: {rb}", exc_info=True)
             raise
         except Exception as e:
             logging.error(f"Error getting preprocess result: {e}", exc_info=True)
@@ -281,11 +359,17 @@ class MultiprocessPreprocessExecutor(PreprocessExecutor):
             return []
 
     def shutdown(self) -> None:
-        if self.pool is None:
-            return
-        logging.info("Shutting down the preprocessing pool...")
-        pool = self.pool
-        pool.close()
+        with self._pool_lock:
+            if self._closed:
+                return
+            self._closed = True
+            pool = self.pool
+            self.pool = None
+            self._generation.invalidate("was shut down")
+            if pool is None:
+                return
+            logging.info("Shutting down the preprocessing pool...")
+            pool.close()
         # Bounded join: if any worker is stuck running a long task, fall back
         # to terminate() so shutdown can't hang indefinitely.
         join_thread = threading.Thread(target=pool.join, daemon=True)
@@ -371,8 +455,9 @@ class MMWorkItem:
         )
         self.embedding_result = vit_emb_cache_.check_cache(self.cache_key)
 
-        # future 可以是 ApplyResult (multiprocess) 或 _LocalResult (local)
+        # future 可以是 concurrent.futures.Future (multiprocess) 或 _LocalResult (local)
         self.future: Optional[Any] = None
+        self.preprocess_pool_generation: Optional[_PreprocessPoolGeneration] = None
 
 
 class MMProcessEngine:
